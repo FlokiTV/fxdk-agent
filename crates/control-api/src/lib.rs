@@ -8,7 +8,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderValue, Method, StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
@@ -18,6 +18,7 @@ use fxdk_agent_config::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::RwLock};
+use tower_http::cors::CorsLayer;
 use utoipa::{OpenApi, ToSchema};
 
 pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
@@ -187,7 +188,20 @@ pub fn router_with_state(state: ControlApiState) -> Router {
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
         .route("/openapi.json", get(openapi))
+        .layer(desktop_cors())
         .with_state(state)
+}
+
+fn desktop_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin([
+            HeaderValue::from_static("http://127.0.0.1:1420"),
+            HeaderValue::from_static("http://localhost:1420"),
+            HeaderValue::from_static("tauri://localhost"),
+            HeaderValue::from_static("http://tauri.localhost"),
+        ])
+        .allow_methods([Method::GET, Method::PATCH])
+        .allow_headers([header::CONTENT_TYPE])
 }
 
 pub async fn serve(
@@ -610,6 +624,28 @@ mod tests {
             "serverProject"
         );
         assert_eq!(store.load().expect("persisted config"), AppConfig::default());
+    }
+
+    #[tokio::test]
+    async fn desktop_origin_can_preflight_config_patch() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/v1/config")
+                    .header(header::ORIGIN, "http://127.0.0.1:1420")
+                    .header(header::ACCESS_CONTROL_REQUEST_METHOD, "PATCH")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("preflight response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some(&"http://127.0.0.1:1420".parse().expect("origin header"))
+        );
     }
 
     #[tokio::test]

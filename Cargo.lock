@@ -1019,6 +1019,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fxdk-agent-fxserver"
+version = "0.1.0"
+dependencies = [
+ "fxdk-agent-config",
+ "fxdk-agent-process-supervisor",
+ "tokio",
+]
+
+[[package]]
 name = "fxdk-agent-host"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,15 @@
+[package]
+name = "fxdk-agent-fxserver"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fxdk-agent-config = { path = "../config" }
+fxdk-agent-process-supervisor = { path = "../process-supervisor" }
+tokio.workspace = true

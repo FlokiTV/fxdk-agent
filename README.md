@@ -65,17 +65,15 @@ Foundation already in place:
 - Cargo workspace with a native Rust host crate;
 - Tauri 2 desktop shell with Svelte 5 + TypeScript bundled by Rspack 2;
 - shared TypeScript protocol package;
+- loopback Control API on `127.0.0.1:35418`;
+- runtime discovery through `/agent.md` and `/openapi.json`;
+- versioned local configuration with `GET/PATCH /v1/config`;
+- runtime path validation before config persistence;
+- Svelte environment configuration view;
 - root-level typecheck/check/build commands;
-- local desktop smoke validated on Windows.
+- local host + frontend smoke validated on Windows.
 
-The next milestone is the loopback Control API with:
-
-- `GET /v1/health`
-- `GET /v1/status`
-- `GET /agent.md`
-- `GET /openapi.json`
-
-FiveM lifecycle support comes after the control plane foundation is testable on its own.
+The next milestone is process supervision and FXServer lifecycle: owned process trees, readiness detection, crash state, deterministic stop, and orphan cleanup.
 
 ## Development
 
@@ -109,6 +107,26 @@ Run the desktop shell in development mode:
 ```bash
 bun run dev:desktop
 ```
+
+### Local configuration
+
+The host creates a versioned local config file in the operating system's local application-data directory. On Windows this resolves under `%LOCALAPPDATA%\FXDK Agent\config.json`.
+
+The public configuration contract contains:
+
+- server project directory;
+- FXServer executable path;
+- FiveM executable path;
+- synthetic development identity toggle.
+
+The same contract is available through:
+
+```http
+GET /v1/config
+PATCH /v1/config
+```
+
+Populated paths are validated before they are persisted. Invalid patches return HTTP `422` with field-specific validation issues.
 
 ## License
 

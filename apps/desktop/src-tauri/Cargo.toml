@@ -1,0 +1,21 @@
+[package]
+name = "fxdk-agent-desktop"
+version = "0.1.0"
+description = "Desktop shell for FXDK Agent"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "fxdk_agent_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

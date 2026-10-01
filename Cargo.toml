@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/desktop/src-tauri", "crates/config", "crates/control-api", "crates/host"]
+members = ["apps/desktop/src-tauri", "crates/config", "crates/control-api", "crates/host", "crates/process-supervisor"]
 resolver = "2"
 
 [workspace.package]
@@ -12,7 +12,8 @@ rust-version = "1.99"
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+process-wrap = { version = "10.0.1", features = ["tokio1"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 utoipa = "5"
 
 [workspace.lints.rust]

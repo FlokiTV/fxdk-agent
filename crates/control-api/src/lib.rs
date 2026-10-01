@@ -16,6 +16,10 @@ use fxdk_agent_config::{
     AppConfig, ConfigPatch, ConfigStore, ConfigStoreError, ConfigValidationIssue,
     SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
 };
+use fxdk_agent_fivem_client::{
+    FivemClientController, FivemClientError, FivemClientEvent, FivemClientPhase,
+    FivemClientSnapshot,
+};
 use fxdk_agent_fxserver::{FxServerController, FxServerError, FxServerPhase, FxServerSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::RwLock};
@@ -29,6 +33,7 @@ pub struct ControlApiState {
     config: Arc<RwLock<AppConfig>>,
     store: Option<ConfigStore>,
     fxserver: FxServerController,
+    client: FivemClientController,
 }
 
 impl ControlApiState {
@@ -37,6 +42,7 @@ impl ControlApiState {
             config: Arc::new(RwLock::new(config)),
             store: None,
             fxserver: FxServerController::default(),
+            client: FivemClientController::default(),
         }
     }
 
@@ -47,6 +53,7 @@ impl ControlApiState {
             config: Arc::new(RwLock::new(config)),
             store: Some(store),
             fxserver: FxServerController::default(),
+            client: FivemClientController::default(),
         })
     }
 
@@ -136,10 +143,16 @@ pub struct ServerStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ClientStatus {
     pub id: u32,
     pub state: ClientState,
     pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub connection_state: Option<u32>,
+    pub game_process_state: Option<u32>,
+    pub log_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -198,6 +211,7 @@ pub fn router_with_state(state: ControlApiState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/server/start", axum::routing::post(start_server))
         .route("/v1/server/stop", axum::routing::post(stop_server))
+        .route("/v1/client/events", axum::routing::post(client_event))
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
         .route("/openapi.json", get(openapi))
@@ -262,10 +276,37 @@ async fn status(State(state): State<ControlApiState>) -> Json<ControlStatus> {
 
 async fn control_status(state: &ControlApiState) -> ControlStatus {
     let server = state.fxserver.snapshot().await;
+    let client = state.client.snapshot().await;
+    let clients = if client.phase == FivemClientPhase::Stopped {
+        Vec::new()
+    } else {
+        vec![client_status(client)]
+    };
 
     ControlStatus {
         server: server_status(server),
+        clients,
         ..ControlStatus::initial()
+    }
+}
+
+fn client_status(snapshot: FivemClientSnapshot) -> ClientStatus {
+    ClientStatus {
+        id: snapshot.id,
+        state: match snapshot.phase {
+            FivemClientPhase::Stopped => ClientState::Stopped,
+            FivemClientPhase::Starting => ClientState::Starting,
+            FivemClientPhase::Connecting => ClientState::Connecting,
+            FivemClientPhase::Active => ClientState::Active,
+            FivemClientPhase::Stopping => ClientState::Stopping,
+            FivemClientPhase::Crashed => ClientState::Crashed,
+        },
+        pid: snapshot.pid,
+        exit_code: snapshot.exit_code,
+        last_error: snapshot.last_error,
+        connection_state: snapshot.connection_state,
+        game_process_state: snapshot.game_process_state,
+        log_tail: snapshot.log_tail,
     }
 }
 
@@ -378,6 +419,52 @@ fn server_stop_error(error: FxServerError) -> HandlerError {
 }
 
 #[utoipa::path(
+    post,
+    path = "/v1/client/events",
+    request_body = FivemClientEvent,
+    responses(
+        (status = 204, description = "Client runtime event accepted"),
+        (status = 422, description = "Client runtime event is invalid", body = ApiErrorResponse)
+    )
+)]
+async fn client_event(
+    State(state): State<ControlApiState>,
+    Json(event): Json<FivemClientEvent>,
+) -> Result<StatusCode, HandlerError> {
+    state
+        .client
+        .record_event(event)
+        .await
+        .map_err(client_event_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn client_event_error(error: FivemClientError) -> HandlerError {
+    let status = if matches!(error, FivemClientError::WrongClientId { .. }) {
+        StatusCode::UNPROCESSABLE_ENTITY
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+
+    (
+        status,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: if status == StatusCode::UNPROCESSABLE_ENTITY {
+                    "CLIENT_EVENT_INVALID".to_owned()
+                } else {
+                    "CLIENT_EVENT_FAILED".to_owned()
+                },
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+#[utoipa::path(
     get,
     path = "/v1/config",
     responses((status = 200, description = "Sanitized local configuration", body = AppConfig))
@@ -463,7 +550,7 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, start_server, stop_server, get_config, patch_config, agent_guide),
+    paths(health, status, start_server, stop_server, client_event, get_config, patch_config, agent_guide),
     components(schemas(
         HealthResponse,
         ApiErrorResponse,
@@ -482,7 +569,8 @@ async fn agent_guide() -> impl IntoResponse {
         ServerStatus,
         ClientStatus,
         AgentStatus,
-        ControlStatus
+        ControlStatus,
+        FivemClientEvent
     )),
     info(
         title = "FXDK Agent Control API",
@@ -639,6 +727,7 @@ mod tests {
         assert!(document["paths"]["/v1/config"]["patch"].is_object());
         assert!(document["paths"]["/v1/server/start"]["post"].is_object());
         assert!(document["paths"]["/v1/server/stop"]["post"].is_object());
+        assert!(document["paths"]["/v1/client/events"]["post"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
     }
 
@@ -684,6 +773,54 @@ mod tests {
             .expect("stop body");
         let status: ControlStatus = serde_json::from_slice(&body).expect("stop json");
         assert_eq!(status.server.state, ServerState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn client_event_accepts_launcher_heartbeat() {
+        let payload = serde_json::json!({
+            "clientId": 1,
+            "kind": "heartbeat",
+            "gameProcessState": 2,
+            "connectionState": 0,
+            "active": false
+        });
+
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/client/events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("client event response");
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn client_event_rejects_other_client_slot() {
+        let payload = serde_json::json!({
+            "clientId": 2,
+            "kind": "heartbeat",
+            "active": false
+        });
+
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/client/events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("client event response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

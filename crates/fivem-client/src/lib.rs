@@ -12,12 +12,13 @@ use fxdk_agent_process_supervisor::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
+use utoipa::ToSchema;
 
 pub const DEFAULT_CLIENT_ID: u32 = 1;
 pub const DEFAULT_RUNTIME_WEB_BASE_URL: &str = "http://127.0.0.1:35419";
 pub const DEFAULT_CONTROL_API_BASE_URL: &str = "http://127.0.0.1:35418";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum FivemClientPhase {
     Stopped,
@@ -28,7 +29,7 @@ pub enum FivemClientPhase {
     Crashed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ClientEventKind {
     SdkReady,
@@ -39,7 +40,7 @@ pub enum ClientEventKind {
     Heartbeat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct FivemClientEvent {
     pub client_id: u32,

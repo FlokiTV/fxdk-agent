@@ -28,6 +28,11 @@ export interface ServerStatus extends ProcessStatus {
 export interface ClientStatus extends ProcessStatus {
   id: number;
   state: ClientState;
+  exitCode: number | null;
+  lastError: string | null;
+  connectionState: number | null;
+  gameProcessState: number | null;
+  logTail: string[];
 }
 
 export interface AgentStatus {

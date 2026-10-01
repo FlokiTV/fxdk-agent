@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 fxdk-agent-config = { path = "../config" }
+fxdk-agent-fivem-client = { path = "../fivem-client" }
 fxdk-agent-fxserver = { path = "../fxserver" }
 serde.workspace = true
 serde_json.workspace = true

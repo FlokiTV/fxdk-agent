@@ -10,5 +10,6 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
+fxdk-agent-config = { path = "../config" }
 fxdk-agent-control-api = { path = "../control-api" }
 tokio.workspace = true

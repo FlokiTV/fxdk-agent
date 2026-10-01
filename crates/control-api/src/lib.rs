@@ -21,6 +21,7 @@ use fxdk_agent_fivem_client::{
     FivemClientSnapshot,
 };
 use fxdk_agent_fxserver::{FxServerController, FxServerError, FxServerPhase, FxServerSnapshot};
+use fxdk_agent_runtime_web::materialize_sdk_root;
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::RwLock};
 use tower_http::cors::CorsLayer;
@@ -156,6 +157,11 @@ pub struct ClientStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ClientRequest {
+    pub client: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AgentStatus {
     pub enabled: bool,
     pub state: AgentState,
@@ -211,6 +217,8 @@ pub fn router_with_state(state: ControlApiState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/server/start", axum::routing::post(start_server))
         .route("/v1/server/stop", axum::routing::post(stop_server))
+        .route("/v1/client/start", axum::routing::post(start_client))
+        .route("/v1/client/stop", axum::routing::post(stop_client))
         .route("/v1/client/events", axum::routing::post(client_event))
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
@@ -420,6 +428,159 @@ fn server_stop_error(error: FxServerError) -> HandlerError {
 
 #[utoipa::path(
     post,
+    path = "/v1/client/start",
+    request_body = ClientRequest,
+    responses(
+        (status = 200, description = "FiveM/FxDK client started", body = ControlStatus),
+        (status = 409, description = "Server not online or client already running", body = ApiErrorResponse),
+        (status = 422, description = "Client configuration is invalid", body = ApiErrorResponse),
+        (status = 500, description = "FiveM/FxDK client failed to start", body = ApiErrorResponse)
+    )
+)]
+async fn start_client(
+    State(state): State<ControlApiState>,
+    Json(request): Json<ClientRequest>,
+) -> Result<Json<ControlStatus>, HandlerError> {
+    validate_client_slot(&state, request.client)?;
+
+    let server = state.fxserver.snapshot().await;
+    if server.phase != FxServerPhase::Online {
+        return Err(client_server_not_online_error());
+    }
+
+    let sdk_root = materialize_sdk_root().map_err(client_runtime_prepare_error)?;
+    let config = state.config_snapshot().await;
+
+    state
+        .client
+        .start(&config, &sdk_root)
+        .await
+        .map_err(client_start_error)?;
+
+    Ok(Json(control_status(&state).await))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/client/stop",
+    request_body = ClientRequest,
+    responses(
+        (status = 200, description = "FiveM/FxDK client stopped", body = ControlStatus),
+        (status = 422, description = "Client slot is unsupported", body = ApiErrorResponse),
+        (status = 500, description = "FiveM/FxDK client failed to stop", body = ApiErrorResponse)
+    )
+)]
+async fn stop_client(
+    State(state): State<ControlApiState>,
+    Json(request): Json<ClientRequest>,
+) -> Result<Json<ControlStatus>, HandlerError> {
+    validate_client_slot(&state, request.client)?;
+
+    state
+        .client
+        .stop()
+        .await
+        .map_err(client_stop_error)?;
+
+    Ok(Json(control_status(&state).await))
+}
+
+fn validate_client_slot(
+    state: &ControlApiState,
+    client: u32,
+) -> Result<(), HandlerError> {
+    if client == state.client.id() {
+        return Ok(());
+    }
+
+    Err((
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "CLIENT_SLOT_UNSUPPORTED".to_owned(),
+                message: format!("client slot {client} is not supported by this MVP"),
+                detail: None,
+            },
+        }),
+    ))
+}
+
+fn client_server_not_online_error() -> HandlerError {
+    (
+        StatusCode::CONFLICT,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "CLIENT_SERVER_NOT_ONLINE".to_owned(),
+                message: "FXServer must be online before starting a client".to_owned(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+fn client_runtime_prepare_error(error: io::Error) -> HandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "CLIENT_RUNTIME_PREPARE_FAILED".to_owned(),
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+fn client_start_error(error: FivemClientError) -> HandlerError {
+    let status = match error {
+        FivemClientError::AlreadyRunning => StatusCode::CONFLICT,
+        FivemClientError::MissingFiveMPath
+        | FivemClientError::InvalidFiveMPath(_)
+        | FivemClientError::InvalidSdkRoot(_)
+        | FivemClientError::WrongClientId { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+        FivemClientError::Spawn(_) | FivemClientError::Stop(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    };
+
+    (
+        status,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: if status == StatusCode::CONFLICT {
+                    "CLIENT_ALREADY_RUNNING".to_owned()
+                } else if status == StatusCode::UNPROCESSABLE_ENTITY {
+                    "CLIENT_CONFIG_INVALID".to_owned()
+                } else {
+                    "CLIENT_START_FAILED".to_owned()
+                },
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+fn client_stop_error(error: FivemClientError) -> HandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "CLIENT_STOP_FAILED".to_owned(),
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+#[utoipa::path(
+    post,
     path = "/v1/client/events",
     request_body = FivemClientEvent,
     responses(
@@ -550,7 +711,7 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, start_server, stop_server, client_event, get_config, patch_config, agent_guide),
+    paths(health, status, start_server, stop_server, start_client, stop_client, client_event, get_config, patch_config, agent_guide),
     components(schemas(
         HealthResponse,
         ApiErrorResponse,
@@ -568,6 +729,7 @@ async fn agent_guide() -> impl IntoResponse {
         LauncherStatus,
         ServerStatus,
         ClientStatus,
+        ClientRequest,
         AgentStatus,
         ControlStatus,
         FivemClientEvent
@@ -727,6 +889,8 @@ mod tests {
         assert!(document["paths"]["/v1/config"]["patch"].is_object());
         assert!(document["paths"]["/v1/server/start"]["post"].is_object());
         assert!(document["paths"]["/v1/server/stop"]["post"].is_object());
+        assert!(document["paths"]["/v1/client/start"]["post"].is_object());
+        assert!(document["paths"]["/v1/client/stop"]["post"].is_object());
         assert!(document["paths"]["/v1/client/events"]["post"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
     }
@@ -773,6 +937,71 @@ mod tests {
             .expect("stop body");
         let status: ControlStatus = serde_json::from_slice(&body).expect("stop json");
         assert_eq!(status.server.state, ServerState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn client_start_requires_online_server() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/client/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"client":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("client start response");
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("client start error body");
+        let error: ApiErrorResponse =
+            serde_json::from_slice(&body).expect("client start error json");
+        assert_eq!(error.error.code, "CLIENT_SERVER_NOT_ONLINE");
+    }
+
+    #[tokio::test]
+    async fn client_stop_is_idempotent_when_stopped() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/client/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"client":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("client stop response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("client stop body");
+        let status: ControlStatus =
+            serde_json::from_slice(&body).expect("client stop json");
+        assert!(status.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn client_slot_two_is_rejected_in_mvp() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/client/stop")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"client":2}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("client stop response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
     }
 
     #[tokio::test]

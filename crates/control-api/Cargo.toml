@@ -14,6 +14,7 @@ axum.workspace = true
 fxdk-agent-config = { path = "../config" }
 fxdk-agent-fivem-client = { path = "../fivem-client" }
 fxdk-agent-fxserver = { path = "../fxserver" }
+fxdk-agent-runtime-web = { path = "../runtime-web" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

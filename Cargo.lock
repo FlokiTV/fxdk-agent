@@ -1004,6 +1004,7 @@ dependencies = [
  "fxdk-agent-config",
  "fxdk-agent-fivem-client",
  "fxdk-agent-fxserver",
+ "fxdk-agent-runtime-web",
  "serde",
  "serde_json",
  "tokio",

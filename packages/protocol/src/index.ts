@@ -61,6 +61,7 @@ export interface AppConfig {
   serverProject: string | null;
   fxserverPath: string | null;
   fivemPath: string | null;
+  serverAddress: string;
   syntheticIdentity: SyntheticIdentityConfig;
 }
 
@@ -72,6 +73,7 @@ export interface ConfigPatch {
   serverProject?: string | null;
   fxserverPath?: string | null;
   fivemPath?: string | null;
+  serverAddress?: string;
   syntheticIdentity?: SyntheticIdentityPatch;
 }
 

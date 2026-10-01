@@ -18,6 +18,7 @@
     serverProject: string;
     fxserverPath: string;
     fivemPath: string;
+    serverAddress: string;
     syntheticIdentityEnabled: boolean;
   }
 
@@ -37,6 +38,7 @@
       serverProject: '',
       fxserverPath: '',
       fivemPath: '',
+      serverAddress: '127.0.0.1:30120',
       syntheticIdentityEnabled: false,
     };
   }
@@ -46,6 +48,7 @@
       serverProject: config.serverProject ?? '',
       fxserverPath: config.fxserverPath ?? '',
       fivemPath: config.fivemPath ?? '',
+      serverAddress: config.serverAddress,
       syntheticIdentityEnabled: config.syntheticIdentity.enabled,
     };
   }
@@ -103,6 +106,7 @@
       serverProject: normalizePath(form.serverProject),
       fxserverPath: normalizePath(form.fxserverPath),
       fivemPath: normalizePath(form.fivemPath),
+      serverAddress: form.serverAddress.trim(),
       syntheticIdentity: {
         enabled: form.syntheticIdentityEnabled,
       },
@@ -188,6 +192,17 @@
           type="text"
           bind:value={form.fivemPath}
           placeholder="C:\Users\you\AppData\Local\FiveM\FiveM.exe"
+          disabled={loading || saving}
+          autocomplete="off"
+        />
+      </label>
+
+      <label>
+        <span>Local server address</span>
+        <input
+          type="text"
+          bind:value={form.serverAddress}
+          placeholder="127.0.0.1:30120"
           disabled={loading || saving}
           autocomplete="off"
         />

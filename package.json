@@ -9,7 +9,14 @@
   ],
   "scripts": {
     "typecheck:protocol": "bunx tsc --noEmit -p packages/protocol/tsconfig.json",
-    "typecheck": "bun run typecheck:protocol"
+    "typecheck:desktop": "bun run --cwd apps/desktop typecheck",
+    "typecheck": "bun run typecheck:protocol && bun run typecheck:desktop",
+    "check:rust": "cargo check --workspace",
+    "check": "bun run typecheck && bun run check:rust",
+    "build:desktop": "bun run --cwd apps/desktop build",
+    "build:rust": "cargo build --workspace",
+    "build": "bun run build:desktop && bun run build:rust",
+    "dev:desktop": "bun run --cwd apps/desktop tauri dev"
   },
   "devDependencies": {
     "typescript": "^5.9.0"

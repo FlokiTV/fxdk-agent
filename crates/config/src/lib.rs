@@ -52,6 +52,75 @@ pub struct SyntheticIdentityPatch {
     pub enabled: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfigValidationIssue {
+    pub field: String,
+    pub code: String,
+    pub message: String,
+}
+
+pub fn validate_runtime_paths(config: &AppConfig) -> Vec<ConfigValidationIssue> {
+    let mut issues = Vec::new();
+
+    if let Some(path) = &config.server_project {
+        if !path.exists() {
+            issues.push(validation_issue(
+                "serverProject",
+                "PATH_NOT_FOUND",
+                format!("server project does not exist: {}", path.display()),
+            ));
+        } else if !path.is_dir() {
+            issues.push(validation_issue(
+                "serverProject",
+                "NOT_A_DIRECTORY",
+                format!("server project is not a directory: {}", path.display()),
+            ));
+        }
+    }
+
+    validate_executable_path("fxserverPath", config.fxserver_path.as_deref(), &mut issues);
+    validate_executable_path("fivemPath", config.fivem_path.as_deref(), &mut issues);
+
+    issues
+}
+
+fn validate_executable_path(
+    field: &str,
+    path: Option<&Path>,
+    issues: &mut Vec<ConfigValidationIssue>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+
+    if !path.exists() {
+        issues.push(validation_issue(
+            field,
+            "PATH_NOT_FOUND",
+            format!("executable does not exist: {}", path.display()),
+        ));
+    } else if !path.is_file() {
+        issues.push(validation_issue(
+            field,
+            "NOT_A_FILE",
+            format!("executable path is not a file: {}", path.display()),
+        ));
+    }
+}
+
+fn validation_issue(
+    field: &str,
+    code: &str,
+    message: String,
+) -> ConfigValidationIssue {
+    ConfigValidationIssue {
+        field: field.to_owned(),
+        code: code.to_owned(),
+        message,
+    }
+}
+
 #[derive(Debug)]
 pub enum ConfigStoreError {
     LocalDataDirectoryUnavailable,
@@ -190,7 +259,7 @@ mod tests {
 
     use super::{
         AppConfig, CONFIG_SCHEMA_VERSION, ConfigPatch, ConfigStore, ConfigStoreError,
-        SyntheticIdentityConfig, SyntheticIdentityPatch,
+        SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
     };
 
     fn test_store(name: &str) -> ConfigStore {
@@ -305,5 +374,56 @@ mod tests {
                 supported: CONFIG_SCHEMA_VERSION
             }
         ));
+    }
+
+    #[test]
+    fn runtime_path_validation_accepts_existing_directory_and_files() {
+        let store = test_store("valid-paths");
+        let root = store.path().parent().expect("test root");
+        let server_project = root.join("server");
+        let fxserver = root.join("FXServer.exe");
+        let fivem = root.join("FiveM.exe");
+
+        fs::create_dir_all(&server_project).expect("create server project");
+        fs::write(&fxserver, b"test").expect("create fxserver");
+        fs::write(&fivem, b"test").expect("create fivem");
+
+        let config = AppConfig {
+            server_project: Some(server_project),
+            fxserver_path: Some(fxserver),
+            fivem_path: Some(fivem),
+            ..AppConfig::default()
+        };
+
+        assert!(validate_runtime_paths(&config).is_empty());
+    }
+
+    #[test]
+    fn runtime_path_validation_reports_field_specific_issues() {
+        let store = test_store("invalid-paths");
+        let root = store.path().parent().expect("test root");
+        fs::create_dir_all(root).expect("create test root");
+
+        let fxserver_directory = root.join("FXServer.exe");
+        fs::create_dir_all(&fxserver_directory).expect("create fake executable directory");
+
+        let config = AppConfig {
+            server_project: Some(root.join("missing-server")),
+            fxserver_path: Some(fxserver_directory),
+            fivem_path: Some(root.join("missing-FiveM.exe")),
+            ..AppConfig::default()
+        };
+
+        let issues = validate_runtime_paths(&config);
+
+        assert!(issues.iter().any(|issue| {
+            issue.field == "serverProject" && issue.code == "PATH_NOT_FOUND"
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.field == "fxserverPath" && issue.code == "NOT_A_FILE"
+        }));
+        assert!(issues.iter().any(|issue| {
+            issue.field == "fivemPath" && issue.code == "PATH_NOT_FOUND"
+        }));
     }
 }

@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 axum.workspace = true
 fxdk-agent-config = { path = "../config" }
+fxdk-agent-dev-identity = { path = "../dev-identity" }
 fxdk-agent-fivem-client = { path = "../fivem-client" }
 fxdk-agent-fxserver = { path = "../fxserver" }
 fxdk-agent-runtime-web = { path = "../runtime-web" }

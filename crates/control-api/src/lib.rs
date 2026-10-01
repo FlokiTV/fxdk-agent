@@ -16,11 +16,14 @@ use fxdk_agent_config::{
     AppConfig, ConfigPatch, ConfigStore, ConfigStoreError, ConfigValidationIssue,
     SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
 };
+use fxdk_agent_dev_identity::{DevIdentityError, DevIdentityStore};
 use fxdk_agent_fivem_client::{
     FivemClientController, FivemClientError, FivemClientEvent, FivemClientPhase,
     FivemClientSnapshot,
 };
-use fxdk_agent_fxserver::{FxServerController, FxServerError, FxServerPhase, FxServerSnapshot};
+use fxdk_agent_fxserver::{
+    FxServerController, FxServerError, FxServerPhase, FxServerSnapshot, FxServerStartOptions,
+};
 use fxdk_agent_runtime_web::materialize_sdk_root;
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::RwLock};
@@ -33,6 +36,7 @@ pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
 pub struct ControlApiState {
     config: Arc<RwLock<AppConfig>>,
     store: Option<ConfigStore>,
+    identity_store: Option<DevIdentityStore>,
     fxserver: FxServerController,
     client: FivemClientController,
 }
@@ -42,6 +46,7 @@ impl ControlApiState {
         Self {
             config: Arc::new(RwLock::new(config)),
             store: None,
+            identity_store: None,
             fxserver: FxServerController::default(),
             client: FivemClientController::default(),
         }
@@ -53,6 +58,7 @@ impl ControlApiState {
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             store: Some(store),
+            identity_store: None,
             fxserver: FxServerController::default(),
             client: FivemClientController::default(),
         })
@@ -60,6 +66,11 @@ impl ControlApiState {
 
     pub async fn config_snapshot(&self) -> AppConfig {
         self.config.read().await.clone()
+    }
+
+    pub fn with_identity_store(mut self, store: DevIdentityStore) -> Self {
+        self.identity_store = Some(store);
+        self
     }
 }
 
@@ -352,10 +363,11 @@ async fn start_server(
     State(state): State<ControlApiState>,
 ) -> Result<Json<ControlStatus>, HandlerError> {
     let config = state.config_snapshot().await;
+    let options = server_start_options(&state, &config)?;
 
     state
         .fxserver
-        .start(&config)
+        .start_with_options(&config, options)
         .await
         .map_err(server_start_error)?;
 
@@ -380,6 +392,41 @@ async fn stop_server(
         .map_err(server_stop_error)?;
 
     Ok(Json(control_status(&state).await))
+}
+
+fn server_start_options(
+    state: &ControlApiState,
+    config: &AppConfig,
+) -> Result<FxServerStartOptions, HandlerError> {
+    if !config.synthetic_identity.enabled {
+        return Ok(FxServerStartOptions::default());
+    }
+
+    let store = match &state.identity_store {
+        Some(store) => store.clone(),
+        None => DevIdentityStore::default_local().map_err(dev_identity_error)?,
+    };
+    let identity = store
+        .identity_for_slot(state.client.id())
+        .map_err(dev_identity_error)?;
+
+    Ok(FxServerStartOptions {
+        synthetic_identity: Some(identity),
+    })
+}
+
+fn dev_identity_error(error: DevIdentityError) -> HandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "DEV_IDENTITY_FAILED".to_owned(),
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
 }
 
 fn server_start_error(error: FxServerError) -> HandlerError {
@@ -754,7 +801,8 @@ mod tests {
     };
     use std::{fs, net::Ipv4Addr, process};
 
-    use fxdk_agent_config::{AppConfig, ConfigStore};
+    use fxdk_agent_config::{AppConfig, ConfigStore, SyntheticIdentityConfig};
+    use fxdk_agent_dev_identity::DevIdentityStore;
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -765,7 +813,8 @@ mod tests {
 
     use super::{
         AgentState, ApiErrorResponse, ControlApiState, ControlStatus, HealthResponse,
-        LauncherState, ServerState, default_control_addr, router, router_with_state, serve,
+        LauncherState, ServerState, default_control_addr, router, router_with_state,
+        server_start_options, serve,
     };
 
     fn test_config_store(name: &str) -> ConfigStore {
@@ -775,6 +824,15 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         ConfigStore::at(root.join("config.json"))
+    }
+
+    fn test_identity_store(name: &str) -> DevIdentityStore {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-control-api-identity-test-{}-{name}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        DevIdentityStore::at(root.join("identity.json"))
     }
 
     #[test]
@@ -893,6 +951,46 @@ mod tests {
         assert!(document["paths"]["/v1/client/stop"]["post"].is_object());
         assert!(document["paths"]["/v1/client/events"]["post"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
+    }
+
+    #[test]
+    fn server_start_options_skip_identity_when_disabled() {
+        let store = test_identity_store("disabled");
+        let path = store.path().to_path_buf();
+        let state = ControlApiState::in_memory(AppConfig::default())
+            .with_identity_store(store);
+
+        let options = server_start_options(&state, &AppConfig::default())
+            .expect("server start options");
+
+        assert!(options.synthetic_identity.is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn server_start_options_use_stable_slot_one_identity_when_enabled() {
+        let store = test_identity_store("enabled");
+        let config = AppConfig {
+            synthetic_identity: SyntheticIdentityConfig { enabled: true },
+            ..AppConfig::default()
+        };
+        let state = ControlApiState::in_memory(config.clone())
+            .with_identity_store(store.clone());
+
+        let first = server_start_options(&state, &config)
+            .expect("first identity")
+            .synthetic_identity
+            .expect("synthetic identity");
+        let second = server_start_options(&state, &config)
+            .expect("second identity")
+            .synthetic_identity
+            .expect("synthetic identity");
+
+        assert_eq!(first.slot, 1);
+        assert_eq!(first, second);
+        assert_eq!(first.payload.len(), 40);
+        assert!(first.payload.starts_with("deadbeef"));
+        assert!(store.path().is_file());
     }
 
     #[tokio::test]

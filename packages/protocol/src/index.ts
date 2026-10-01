@@ -20,6 +20,9 @@ export interface LauncherStatus extends ProcessStatus {
 export interface ServerStatus extends ProcessStatus {
   state: ServerState;
   address: string | null;
+  exitCode: number | null;
+  lastError: string | null;
+  logTail: string[];
 }
 
 export interface ClientStatus extends ProcessStatus {

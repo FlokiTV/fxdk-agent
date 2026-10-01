@@ -1034,6 +1034,7 @@ version = "0.1.0"
 dependencies = [
  "fxdk-agent-config",
  "fxdk-agent-control-api",
+ "fxdk-agent-runtime-web",
  "tokio",
 ]
 

@@ -12,4 +12,5 @@ workspace = true
 [dependencies]
 fxdk-agent-config = { path = "../config" }
 fxdk-agent-control-api = { path = "../control-api" }
+fxdk-agent-runtime-web = { path = "../runtime-web" }
 tokio.workspace = true

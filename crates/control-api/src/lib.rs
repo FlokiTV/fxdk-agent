@@ -16,6 +16,7 @@ use fxdk_agent_config::{
     AppConfig, ConfigPatch, ConfigStore, ConfigStoreError, ConfigValidationIssue,
     SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
 };
+use fxdk_agent_fxserver::{FxServerController, FxServerError, FxServerPhase, FxServerSnapshot};
 use serde::{Deserialize, Serialize};
 use tokio::{net::TcpListener, sync::RwLock};
 use tower_http::cors::CorsLayer;
@@ -27,6 +28,7 @@ pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
 pub struct ControlApiState {
     config: Arc<RwLock<AppConfig>>,
     store: Option<ConfigStore>,
+    fxserver: FxServerController,
 }
 
 impl ControlApiState {
@@ -34,6 +36,7 @@ impl ControlApiState {
         Self {
             config: Arc::new(RwLock::new(config)),
             store: None,
+            fxserver: FxServerController::default(),
         }
     }
 
@@ -43,6 +46,7 @@ impl ControlApiState {
         Ok(Self {
             config: Arc::new(RwLock::new(config)),
             store: Some(store),
+            fxserver: FxServerController::default(),
         })
     }
 
@@ -121,10 +125,14 @@ pub struct LauncherStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerStatus {
     pub state: ServerState,
     pub address: Option<String>,
     pub pid: Option<u32>,
+    pub exit_code: Option<i32>,
+    pub last_error: Option<String>,
+    pub log_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -159,6 +167,9 @@ impl ControlStatus {
                 state: ServerState::Stopped,
                 address: None,
                 pid: None,
+                exit_code: None,
+                last_error: None,
+                log_tail: Vec::new(),
             },
             clients: Vec::new(),
             agent: AgentStatus {
@@ -185,6 +196,8 @@ pub fn router_with_state(state: ControlApiState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route("/v1/server/start", axum::routing::post(start_server))
+        .route("/v1/server/stop", axum::routing::post(stop_server))
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
         .route("/openapi.json", get(openapi))
@@ -200,7 +213,7 @@ fn desktop_cors() -> CorsLayer {
             HeaderValue::from_static("tauri://localhost"),
             HeaderValue::from_static("http://tauri.localhost"),
         ])
-        .allow_methods([Method::GET, Method::PATCH])
+        .allow_methods([Method::GET, Method::PATCH, Method::POST])
         .allow_headers([header::CONTENT_TYPE])
 }
 
@@ -243,11 +256,126 @@ async fn health() -> Json<HealthResponse> {
     path = "/v1/status",
     responses((status = 200, description = "Current control plane state", body = ControlStatus))
 )]
-async fn status() -> Json<ControlStatus> {
-    Json(ControlStatus::initial())
+async fn status(State(state): State<ControlApiState>) -> Json<ControlStatus> {
+    Json(control_status(&state).await)
 }
 
-type ConfigHandlerError = (StatusCode, Json<ApiErrorResponse>);
+async fn control_status(state: &ControlApiState) -> ControlStatus {
+    let server = state.fxserver.snapshot().await;
+
+    ControlStatus {
+        server: server_status(server),
+        ..ControlStatus::initial()
+    }
+}
+
+fn server_status(snapshot: FxServerSnapshot) -> ServerStatus {
+    ServerStatus {
+        state: match snapshot.phase {
+            FxServerPhase::Stopped => ServerState::Stopped,
+            FxServerPhase::Starting => ServerState::Starting,
+            FxServerPhase::Online => ServerState::Online,
+            FxServerPhase::Stopping => ServerState::Stopping,
+            FxServerPhase::Crashed => ServerState::Crashed,
+        },
+        address: snapshot.address,
+        pid: snapshot.pid,
+        exit_code: snapshot.exit_code,
+        last_error: snapshot.last_error,
+        log_tail: snapshot.log_tail,
+    }
+}
+
+type HandlerError = (StatusCode, Json<ApiErrorResponse>);
+type ConfigHandlerError = HandlerError;
+
+#[utoipa::path(
+    post,
+    path = "/v1/server/start",
+    responses(
+        (status = 200, description = "FXServer reached readiness", body = ControlStatus),
+        (status = 409, description = "FXServer is already running", body = ApiErrorResponse),
+        (status = 422, description = "FXServer configuration is incomplete", body = ApiErrorResponse),
+        (status = 500, description = "FXServer failed to start", body = ApiErrorResponse)
+    )
+)]
+async fn start_server(
+    State(state): State<ControlApiState>,
+) -> Result<Json<ControlStatus>, HandlerError> {
+    let config = state.config_snapshot().await;
+
+    state
+        .fxserver
+        .start(&config)
+        .await
+        .map_err(server_start_error)?;
+
+    Ok(Json(control_status(&state).await))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/server/stop",
+    responses(
+        (status = 200, description = "FXServer stopped", body = ControlStatus),
+        (status = 500, description = "FXServer failed to stop", body = ApiErrorResponse)
+    )
+)]
+async fn stop_server(
+    State(state): State<ControlApiState>,
+) -> Result<Json<ControlStatus>, HandlerError> {
+    state
+        .fxserver
+        .stop()
+        .await
+        .map_err(server_stop_error)?;
+
+    Ok(Json(control_status(&state).await))
+}
+
+fn server_start_error(error: FxServerError) -> HandlerError {
+    let status = match error {
+        FxServerError::AlreadyRunning => StatusCode::CONFLICT,
+        FxServerError::MissingServerProject
+        | FxServerError::MissingFxServerPath
+        | FxServerError::MissingServerConfig(_)
+        | FxServerError::InvalidServerProject(_)
+        | FxServerError::InvalidFxServerPath(_) => StatusCode::UNPROCESSABLE_ENTITY,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+
+    (
+        status,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: if status == StatusCode::CONFLICT {
+                    "SERVER_ALREADY_RUNNING".to_owned()
+                } else if status == StatusCode::UNPROCESSABLE_ENTITY {
+                    "SERVER_CONFIG_INVALID".to_owned()
+                } else {
+                    "SERVER_START_FAILED".to_owned()
+                },
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+fn server_stop_error(error: FxServerError) -> HandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "SERVER_STOP_FAILED".to_owned(),
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
 
 #[utoipa::path(
     get,
@@ -335,7 +463,7 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, get_config, patch_config, agent_guide),
+    paths(health, status, start_server, stop_server, get_config, patch_config, agent_guide),
     components(schemas(
         HealthResponse,
         ApiErrorResponse,
@@ -509,7 +637,53 @@ mod tests {
         assert!(document["paths"]["/v1/status"]["get"].is_object());
         assert!(document["paths"]["/v1/config"]["get"].is_object());
         assert!(document["paths"]["/v1/config"]["patch"].is_object());
+        assert!(document["paths"]["/v1/server/start"]["post"].is_object());
+        assert!(document["paths"]["/v1/server/stop"]["post"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn server_start_rejects_missing_configuration() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/server/start")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("start response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("start error body");
+        let error: ApiErrorResponse = serde_json::from_slice(&body).expect("start error json");
+        assert_eq!(error.error.code, "SERVER_CONFIG_INVALID");
+    }
+
+    #[tokio::test]
+    async fn server_stop_is_idempotent_when_stopped() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/server/stop")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("stop response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("stop body");
+        let status: ControlStatus = serde_json::from_slice(&body).expect("stop json");
+        assert_eq!(status.server.state, ServerState::Stopped);
     }
 
     #[tokio::test]

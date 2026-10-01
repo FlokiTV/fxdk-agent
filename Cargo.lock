@@ -1002,6 +1002,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "fxdk-agent-config",
+ "fxdk-agent-fxserver",
  "serde",
  "serde_json",
  "tokio",

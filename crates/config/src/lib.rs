@@ -40,10 +40,23 @@ pub struct SyntheticIdentityConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPatch {
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub server_project: Option<Option<PathBuf>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub fxserver_path: Option<Option<PathBuf>>,
+    #[serde(default, deserialize_with = "deserialize_double_option")]
     pub fivem_path: Option<Option<PathBuf>>,
     pub synthetic_identity: Option<SyntheticIdentityPatch>,
+}
+
+fn deserialize_double_option<'de, D, T>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -320,6 +333,25 @@ mod tests {
         });
 
         assert_eq!(config.server_project, None);
+    }
+
+    #[test]
+    fn json_patch_distinguishes_omitted_and_explicit_null() {
+        let omitted: ConfigPatch =
+            serde_json::from_str(r#"{"syntheticIdentity":{"enabled":true}}"#)
+                .expect("deserialize omitted path");
+        assert_eq!(omitted.server_project, None);
+
+        let clear: ConfigPatch =
+            serde_json::from_str(r#"{"serverProject":null}"#).expect("deserialize clear path");
+        assert_eq!(clear.server_project, Some(None));
+
+        let set: ConfigPatch =
+            serde_json::from_str(r#"{"serverProject":"D:\\server"}"#).expect("deserialize set path");
+        assert_eq!(
+            set.server_project,
+            Some(Some(PathBuf::from(r"D:\server")))
+        );
     }
 
     #[test]

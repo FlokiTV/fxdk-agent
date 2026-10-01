@@ -19,7 +19,7 @@ FXDK Agent is an open-source local development and QA harness for FiveM/FxDK env
 
 - **Rust** — native host, process supervision, Windows integration, filesystem/runtime overlays, input bridges, and the local Control API.
 - **TypeScript** — desktop UI, protocol schemas, SDK, documentation tooling, automation, and end-to-end tests.
-- **Tauri** — current candidate for the desktop shell. This is not final until the scaffold is validated.
+- **Tauri 2** — desktop shell for the MVP; the Windows scaffold has been validated locally.
 
 ## Architecture
 
@@ -56,14 +56,57 @@ Optional in-game Agent API
 
 ## Project status
 
-The repository is currently **documentation-first WIP**. Runtime code has not been scaffolded yet. The first implementation milestone is the Rust host plus a minimal loopback Control API with:
+The repository is currently **WIP** and the MVP implementation is underway.
+
+Foundation already in place:
+
+- Cargo workspace with a native Rust host crate;
+- Tauri 2 + TypeScript desktop shell;
+- shared TypeScript protocol package;
+- root-level typecheck/check/build commands;
+- local desktop smoke validated on Windows.
+
+The next milestone is the loopback Control API with:
 
 - `GET /v1/health`
 - `GET /v1/status`
 - `GET /agent.md`
 - `GET /openapi.json`
 
-FiveM lifecycle support comes after that foundation is testable on its own.
+FiveM lifecycle support comes after the control plane foundation is testable on its own.
+
+## Development
+
+Current development prerequisites:
+
+- Windows;
+- Rust stable with the MSVC target/toolchain;
+- Bun 1.4 or newer;
+- Tauri Windows prerequisites, including the Microsoft C++ build tools and WebView2 runtime.
+
+Install dependencies:
+
+```bash
+bun install
+```
+
+Validate the workspace:
+
+```bash
+bun run check
+```
+
+Build the TypeScript frontend and Rust workspace:
+
+```bash
+bun run build
+```
+
+Run the desktop shell in development mode:
+
+```bash
+bun run dev:desktop
+```
 
 ## License
 

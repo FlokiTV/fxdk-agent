@@ -16,6 +16,100 @@ pub struct HealthResponse {
     pub version: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LauncherState {
+    Starting,
+    Ready,
+    Stopping,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerState {
+    Stopped,
+    Starting,
+    Online,
+    Stopping,
+    Crashed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ClientState {
+    Stopped,
+    Starting,
+    Connecting,
+    Active,
+    Stopping,
+    Crashed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentState {
+    Disabled,
+    Starting,
+    Ready,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LauncherStatus {
+    pub state: LauncherState,
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerStatus {
+    pub state: ServerState,
+    pub address: Option<String>,
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientStatus {
+    pub id: u32,
+    pub state: ClientState,
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentStatus {
+    pub enabled: bool,
+    pub state: AgentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlStatus {
+    pub launcher: LauncherStatus,
+    pub server: ServerStatus,
+    pub clients: Vec<ClientStatus>,
+    pub agent: AgentStatus,
+}
+
+impl ControlStatus {
+    pub fn initial() -> Self {
+        Self {
+            launcher: LauncherStatus {
+                state: LauncherState::Ready,
+                pid: Some(std::process::id()),
+            },
+            server: ServerStatus {
+                state: ServerState::Stopped,
+                address: None,
+                pid: None,
+            },
+            clients: Vec::new(),
+            agent: AgentStatus {
+                enabled: false,
+                state: AgentState::Disabled,
+            },
+        }
+    }
+}
+
 pub fn default_control_addr() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_CONTROL_PORT))
 }
@@ -25,7 +119,9 @@ pub async fn bind_default() -> io::Result<TcpListener> {
 }
 
 pub fn router() -> Router {
-    Router::new().route("/v1/health", get(health))
+    Router::new()
+        .route("/v1/health", get(health))
+        .route("/v1/status", get(status))
 }
 
 pub async fn serve(
@@ -44,6 +140,10 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+async fn status() -> Json<ControlStatus> {
+    Json(ControlStatus::initial())
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -52,7 +152,10 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{HealthResponse, default_control_addr, router};
+    use super::{
+        AgentState, ControlStatus, HealthResponse, LauncherState, ServerState,
+        default_control_addr, router,
+    };
 
     #[test]
     fn default_address_is_loopback_only() {
@@ -80,5 +183,34 @@ mod tests {
 
         assert!(payload.ok);
         assert_eq!(payload.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn status_route_reports_initial_control_plane_state() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("status response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status body");
+        let payload: ControlStatus = serde_json::from_slice(&body).expect("status json");
+
+        assert_eq!(payload.launcher.state, LauncherState::Ready);
+        assert_eq!(payload.launcher.pid, Some(std::process::id()));
+        assert_eq!(payload.server.state, ServerState::Stopped);
+        assert_eq!(payload.server.address, None);
+        assert_eq!(payload.server.pid, None);
+        assert!(payload.clients.is_empty());
+        assert!(!payload.agent.enabled);
+        assert_eq!(payload.agent.state, AgentState::Disabled);
     }
 }

@@ -1,0 +1,12 @@
+[workspace]
+members = ["crates/host"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/FlokiTV/fxdk-agent"
+rust-version = "1.99"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"

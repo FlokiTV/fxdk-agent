@@ -49,3 +49,38 @@ export interface ApiErrorResponse {
   ok: false;
   error: ApiErrorDetail;
 }
+
+export const CONFIG_SCHEMA_VERSION = 1 as const;
+
+export interface SyntheticIdentityConfig {
+  enabled: boolean;
+}
+
+export interface AppConfig {
+  schemaVersion: number;
+  serverProject: string | null;
+  fxserverPath: string | null;
+  fivemPath: string | null;
+  syntheticIdentity: SyntheticIdentityConfig;
+}
+
+export interface SyntheticIdentityPatch {
+  enabled?: boolean;
+}
+
+export interface ConfigPatch {
+  serverProject?: string | null;
+  fxserverPath?: string | null;
+  fivemPath?: string | null;
+  syntheticIdentity?: SyntheticIdentityPatch;
+}
+
+export interface ConfigValidationIssue {
+  field: 'serverProject' | 'fxserverPath' | 'fivemPath' | string;
+  code: string;
+  message: string;
+}
+
+export interface ConfigValidationErrorDetail {
+  issues: ConfigValidationIssue[];
+}

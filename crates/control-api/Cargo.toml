@@ -1,5 +1,5 @@
 [package]
-name = "fxdk-agent-host"
+name = "fxdk-agent-control-api"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -10,5 +10,10 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-fxdk-agent-control-api = { path = "../control-api" }
+axum.workspace = true
+serde.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tower = { version = "0.5", features = ["util"] }

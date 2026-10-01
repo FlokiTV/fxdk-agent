@@ -1022,6 +1022,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fxdk-agent-dev-identity"
+version = "0.1.0"
+dependencies = [
+ "directories",
+ "getrandom 0.3.4",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "fxdk-agent-fivem-client"
 version = "0.1.0"
 dependencies = [

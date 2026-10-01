@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/desktop/src-tauri", "crates/config", "crates/control-api", "crates/fivem-client", "crates/fxserver", "crates/host", "crates/process-supervisor", "crates/runtime-web"]
+members = ["apps/desktop/src-tauri", "crates/config", "crates/control-api", "crates/dev-identity", "crates/fivem-client", "crates/fxserver", "crates/host", "crates/process-supervisor", "crates/runtime-web"]
 resolver = "2"
 
 [workspace.package]

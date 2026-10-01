@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 axum.workspace = true
+directories = "6"
 tokio.workspace = true
 
 [dev-dependencies]

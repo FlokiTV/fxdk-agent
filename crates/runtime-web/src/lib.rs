@@ -1,7 +1,9 @@
 use std::{
+    fs,
     future::Future,
     io,
     net::{Ipv4Addr, SocketAddr},
+    path::{Path, PathBuf},
 };
 
 use axum::{
@@ -10,12 +12,15 @@ use axum::{
     response::IntoResponse,
     routing::get,
 };
+use directories::BaseDirs;
 use tokio::net::TcpListener;
 
 pub const DEFAULT_RUNTIME_WEB_PORT: u16 = 35_419;
 
 const INDEX_HTML: &str = include_str!("../../../runtime/fxdk/index.html");
 const GAME_VIEW_JS: &str = include_str!("../../../runtime/fxdk/game-view.js");
+const FXMANIFEST_LUA: &str = include_str!("../../../runtime/fxdk/fxmanifest.lua");
+const LAUNCHER_JS: &str = include_str!("../../../runtime/fxdk/launcher.js");
 
 pub fn default_runtime_web_addr() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RUNTIME_WEB_PORT))
@@ -23,6 +28,36 @@ pub fn default_runtime_web_addr() -> SocketAddr {
 
 pub async fn bind_default() -> io::Result<TcpListener> {
     TcpListener::bind(default_runtime_web_addr()).await
+}
+
+pub fn materialize_sdk_root() -> io::Result<PathBuf> {
+    let base_dirs = BaseDirs::new()
+        .ok_or_else(|| io::Error::other("local data directory is unavailable"))?;
+    let root = base_dirs
+        .data_local_dir()
+        .join("FXDK Agent")
+        .join("runtime")
+        .join("fxdk");
+
+    materialize_sdk_root_at(&root)?;
+    Ok(root)
+}
+
+pub fn materialize_sdk_root_at(root: &Path) -> io::Result<()> {
+    fs::create_dir_all(root)?;
+    write_asset(&root.join("fxmanifest.lua"), FXMANIFEST_LUA)?;
+    write_asset(&root.join("launcher.js"), LAUNCHER_JS)?;
+    write_asset(&root.join("index.html"), INDEX_HTML)?;
+    write_asset(&root.join("game-view.js"), GAME_VIEW_JS)?;
+    Ok(())
+}
+
+fn write_asset(path: &Path, content: &str) -> io::Result<()> {
+    if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        return Ok(());
+    }
+
+    fs::write(path, content)
 }
 
 pub fn router() -> Router {
@@ -65,17 +100,41 @@ fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, process};
+
     use axum::{
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
     use tower::ServiceExt;
 
-    use super::{default_runtime_web_addr, router};
+    use super::{default_runtime_web_addr, materialize_sdk_root_at, router};
 
     #[test]
     fn runtime_web_is_loopback_only() {
         assert!(default_runtime_web_addr().ip().is_loopback());
+    }
+
+    #[test]
+    fn materializes_self_contained_sdk_root() {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-runtime-web-test-{}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+
+        materialize_sdk_root_at(&root).expect("materialize sdk root");
+
+        for file in ["fxmanifest.lua", "launcher.js", "index.html", "game-view.js"] {
+            assert!(root.join(file).is_file(), "{file} must be materialized");
+        }
+
+        let launcher = fs::read_to_string(root.join("launcher.js"))
+            .expect("launcher js");
+        assert!(launcher.contains("sdk:startGame"));
+        assert!(launcher.contains("/v1/client/events"));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[tokio::test]

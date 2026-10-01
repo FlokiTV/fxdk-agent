@@ -955,6 +955,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fxdk-agent-config"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fxdk-agent-control-api"
 version = "0.1.0"
 dependencies = [

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_SERVER_ADDRESS: &str = "127.0.0.1:30120";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -20,7 +21,13 @@ pub struct AppConfig {
     pub fxserver_path: Option<PathBuf>,
     #[schema(value_type = Option<String>)]
     pub fivem_path: Option<PathBuf>,
+    #[serde(default = "default_server_address")]
+    pub server_address: String,
     pub synthetic_identity: SyntheticIdentityConfig,
+}
+
+fn default_server_address() -> String {
+    DEFAULT_SERVER_ADDRESS.to_owned()
 }
 
 impl Default for AppConfig {
@@ -30,6 +37,7 @@ impl Default for AppConfig {
             server_project: None,
             fxserver_path: None,
             fivem_path: None,
+            server_address: default_server_address(),
             synthetic_identity: SyntheticIdentityConfig::default(),
         }
     }
@@ -53,6 +61,7 @@ pub struct ConfigPatch {
     #[serde(default, deserialize_with = "deserialize_double_option")]
     #[schema(value_type = Option<String>)]
     pub fivem_path: Option<Option<PathBuf>>,
+    pub server_address: Option<String>,
     pub synthetic_identity: Option<SyntheticIdentityPatch>,
 }
 
@@ -101,6 +110,7 @@ pub fn validate_runtime_paths(config: &AppConfig) -> Vec<ConfigValidationIssue> 
 
     validate_executable_path("fxserverPath", config.fxserver_path.as_deref(), &mut issues);
     validate_executable_path("fivemPath", config.fivem_path.as_deref(), &mut issues);
+    validate_server_address(&config.server_address, &mut issues);
 
     issues
 }
@@ -125,6 +135,35 @@ fn validate_executable_path(
             field,
             "NOT_A_FILE",
             format!("executable path is not a file: {}", path.display()),
+        ));
+    }
+}
+
+fn validate_server_address(
+    address: &str,
+    issues: &mut Vec<ConfigValidationIssue>,
+) {
+    let normalized = address.trim();
+    let Some((host, port_text)) = normalized.rsplit_once(':') else {
+        issues.push(validation_issue(
+            "serverAddress",
+            "INVALID_ADDRESS",
+            "server address must use host:port".to_owned(),
+        ));
+        return;
+    };
+
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    let loopback = host == "localhost"
+        || host == "::1"
+        || host.starts_with("127.");
+    let valid_port = port_text.parse::<u16>().is_ok_and(|port| port > 0);
+
+    if !loopback || !valid_port {
+        issues.push(validation_issue(
+            "serverAddress",
+            "INVALID_ADDRESS",
+            "server address must be loopback host:port".to_owned(),
         ));
     }
 }
@@ -265,6 +304,9 @@ impl AppConfig {
         if let Some(fivem_path) = patch.fivem_path {
             self.fivem_path = fivem_path;
         }
+        if let Some(server_address) = patch.server_address {
+            self.server_address = server_address;
+        }
         if let Some(synthetic_identity) = patch.synthetic_identity
             && let Some(enabled) = synthetic_identity.enabled
         {
@@ -278,8 +320,8 @@ mod tests {
     use std::{fs, path::PathBuf, process};
 
     use super::{
-        AppConfig, CONFIG_SCHEMA_VERSION, ConfigPatch, ConfigStore, ConfigStoreError,
-        SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
+        AppConfig, CONFIG_SCHEMA_VERSION, DEFAULT_SERVER_ADDRESS, ConfigPatch, ConfigStore,
+        ConfigStoreError, SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
     };
 
     fn test_store(name: &str) -> ConfigStore {
@@ -299,6 +341,7 @@ mod tests {
         assert_eq!(config.server_project, None);
         assert_eq!(config.fxserver_path, None);
         assert_eq!(config.fivem_path, None);
+        assert_eq!(config.server_address, DEFAULT_SERVER_ADDRESS);
         assert!(!config.synthetic_identity.enabled);
     }
 
@@ -309,6 +352,7 @@ mod tests {
             server_project: Some(PathBuf::from(r"D:\server")),
             fxserver_path: Some(PathBuf::from(r"D:\cfx\FXServer.exe")),
             fivem_path: Some(PathBuf::from(r"C:\FiveM\FiveM.exe")),
+            server_address: "127.0.0.1:30120".to_owned(),
             synthetic_identity: SyntheticIdentityConfig { enabled: true },
         };
 
@@ -316,6 +360,7 @@ mod tests {
 
         assert_eq!(value["schemaVersion"], CONFIG_SCHEMA_VERSION);
         assert_eq!(value["serverProject"], r"D:\server");
+        assert_eq!(value["serverAddress"], "127.0.0.1:30120");
         assert_eq!(value["syntheticIdentity"]["enabled"], true);
     }
 
@@ -359,6 +404,22 @@ mod tests {
             set.server_project,
             Some(Some(PathBuf::from(r"D:\server")))
         );
+    }
+
+    #[test]
+    fn legacy_schema_v1_without_server_address_uses_default() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{
+  "schemaVersion": 1,
+  "serverProject": null,
+  "fxserverPath": null,
+  "fivemPath": null,
+  "syntheticIdentity": { "enabled": false }
+}"#,
+        )
+        .expect("deserialize legacy v1");
+
+        assert_eq!(config.server_address, DEFAULT_SERVER_ADDRESS);
     }
 
     #[test]
@@ -463,6 +524,20 @@ mod tests {
         }));
         assert!(issues.iter().any(|issue| {
             issue.field == "fivemPath" && issue.code == "PATH_NOT_FOUND"
+        }));
+    }
+
+    #[test]
+    fn runtime_validation_rejects_non_loopback_server_address() {
+        let config = AppConfig {
+            server_address: "192.168.1.10:30120".to_owned(),
+            ..AppConfig::default()
+        };
+
+        let issues = validate_runtime_paths(&config);
+
+        assert!(issues.iter().any(|issue| {
+            issue.field == "serverAddress" && issue.code == "INVALID_ADDRESS"
         }));
     }
 }

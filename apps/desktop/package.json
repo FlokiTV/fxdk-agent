@@ -10,7 +10,8 @@
     "tauri": "tauri"
   },
   "dependencies": {
-    "svelte": "^5.57.1"
+    "svelte": "^5.57.1",
+    "@fxdk-agent/protocol": "workspace:*"
   },
   "devDependencies": {
     "@rspack/cli": "^2.2.8",

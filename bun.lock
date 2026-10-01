@@ -12,6 +12,7 @@
       "name": "@fxdk-agent/desktop",
       "version": "0.1.0",
       "dependencies": {
+        "@fxdk-agent/protocol": "workspace:*",
         "svelte": "^5.57.1",
       },
       "devDependencies": {

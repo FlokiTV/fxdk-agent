@@ -29,6 +29,55 @@ GET /openapi.json
 
 Read `/openapi.json` before assuming an operation exists. The project is WIP and capabilities are added incrementally.
 
+## Preferred managed lifecycle
+
+For the MVP, prefer the high-level session endpoints over manually sequencing server and client operations.
+
+Start one managed development session:
+
+```http
+POST /v1/session/start
+Content-Type: application/json
+
+{"clients":1}
+```
+
+A successful response is returned only after:
+
+```text
+FXServer online
+-> FiveM/FxDK launched
+-> GameRuntime running
+-> client connection state ACTIVE
+```
+
+Check current state at any time:
+
+```http
+GET /v1/status
+```
+
+Stop the managed session:
+
+```http
+POST /v1/session/stop
+```
+
+The stop operation tears down the managed FiveM/FxDK process tree first and then FXServer.
+
+Lower-level `/v1/server/*` and `/v1/client/*` endpoints remain available for diagnostics and focused testing. Do not mix those manual lifecycle calls into an active managed session.
+
+## Configuration
+
+Read or update the local development environment through:
+
+```http
+GET /v1/config
+PATCH /v1/config
+```
+
+Configured runtime paths and the server address are validated before persistence. The managed server address is loopback-only.
+
 ## Operating rules
 
 - Treat the Control API as the lifecycle authority; do not duplicate process-management logic externally.

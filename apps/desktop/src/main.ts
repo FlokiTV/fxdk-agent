@@ -1,5 +1,10 @@
-const statusElement = document.querySelector<HTMLElement>('#shell-status');
+import { mount } from 'svelte';
+import App from './App.svelte';
 
-if (statusElement) {
-  statusElement.textContent = 'Ready';
+const target = document.getElementById('app');
+
+if (!target) {
+  throw new Error('FXDK Agent desktop root element was not found');
 }
+
+mount(App, { target });

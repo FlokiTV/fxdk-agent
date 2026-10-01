@@ -18,7 +18,9 @@ FXDK Agent is an open-source local development and QA harness for FiveM/FxDK env
 ## Planned stack
 
 - **Rust** — native host, process supervision, Windows integration, filesystem/runtime overlays, input bridges, and the local Control API.
-- **TypeScript** — desktop UI, protocol schemas, SDK, documentation tooling, automation, and end-to-end tests.
+- **Svelte 5 + TypeScript** — desktop UI and reactive application state.
+- **Rspack 2** — frontend bundler and development server.
+- **TypeScript** — protocol schemas, SDK, documentation tooling, automation, and end-to-end tests.
 - **Tauri 2** — desktop shell for the MVP; the Windows scaffold has been validated locally.
 
 ## Architecture
@@ -61,7 +63,7 @@ The repository is currently **WIP** and the MVP implementation is underway.
 Foundation already in place:
 
 - Cargo workspace with a native Rust host crate;
-- Tauri 2 + TypeScript desktop shell;
+- Tauri 2 desktop shell with Svelte 5 + TypeScript bundled by Rspack 2;
 - shared TypeScript protocol package;
 - root-level typecheck/check/build commands;
 - local desktop smoke validated on Windows.

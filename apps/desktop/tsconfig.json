@@ -10,10 +10,13 @@
     "isolatedModules": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+    "allowJs": true,
+    "checkJs": true,
+    "verbatimModuleSyntax": true
   },
   "include": [
     "src/**/*.ts",
-    "vite.config.ts"
+    "src/**/*.svelte"
   ]
 }

@@ -9,8 +9,8 @@ FXDK Agent is split into a native host, TypeScript-facing tooling, and an option
 |                    FXDK Agent Desktop                    |
 |                                                          |
 |  +----------------------+    +------------------------+  |
-|  | TypeScript UI        |    | TypeScript SDK         |  |
-|  | Tauri/WebView        |    | schemas / clients      |  |
+|  | Svelte + TypeScript  |    | TypeScript SDK         |  |
+|  | Rspack + Tauri       |    | schemas / clients      |  |
 |  +----------+-----------+    +-----------+------------+  |
 |             |                            |               |
 |             +------------ HTTP ----------+               |
@@ -61,7 +61,7 @@ Loopback HTTP server for health, status, lifecycle, sanitized configuration, dis
 
 ### apps/ui
 
-Human-facing desktop UI. It must not directly own subprocess lifecycle; it calls the same service layer exposed through the Control API.
+Human-facing desktop UI built with Svelte 5 + TypeScript and bundled by Rspack 2 inside the Tauri WebView. It must not directly own subprocess lifecycle; it calls the same service layer exposed through the Control API.
 
 ### packages/protocol
 

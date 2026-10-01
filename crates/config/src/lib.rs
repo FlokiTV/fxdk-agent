@@ -1,5 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    error::Error,
+    fmt, fs, io,
+    path::{Path, PathBuf},
+};
 
+use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
@@ -47,6 +52,119 @@ pub struct SyntheticIdentityPatch {
     pub enabled: Option<bool>,
 }
 
+#[derive(Debug)]
+pub enum ConfigStoreError {
+    LocalDataDirectoryUnavailable,
+    Io(io::Error),
+    Json(serde_json::Error),
+    UnsupportedSchema { found: u32, supported: u32 },
+}
+
+impl fmt::Display for ConfigStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LocalDataDirectoryUnavailable => {
+                write!(formatter, "local data directory is unavailable")
+            }
+            Self::Io(error) => write!(formatter, "config I/O failed: {error}"),
+            Self::Json(error) => write!(formatter, "config JSON is invalid: {error}"),
+            Self::UnsupportedSchema { found, supported } => write!(
+                formatter,
+                "unsupported config schema version {found}; supported version is {supported}"
+            ),
+        }
+    }
+}
+
+impl Error for ConfigStoreError {}
+
+impl From<io::Error> for ConfigStoreError {
+    fn from(error: io::Error) -> Self {
+        Self::Io(error)
+    }
+}
+
+impl From<serde_json::Error> for ConfigStoreError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigStore {
+    path: PathBuf,
+}
+
+impl ConfigStore {
+    pub fn at(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
+    pub fn default_local() -> Result<Self, ConfigStoreError> {
+        Ok(Self::at(default_config_path()?))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn load(&self) -> Result<AppConfig, ConfigStoreError> {
+        if !self.path.exists() {
+            return Ok(AppConfig::default());
+        }
+
+        let bytes = fs::read(&self.path)?;
+        let config: AppConfig = serde_json::from_slice(&bytes)?;
+        validate_schema(&config)?;
+
+        Ok(config)
+    }
+
+    pub fn load_or_create(&self) -> Result<AppConfig, ConfigStoreError> {
+        if self.path.exists() {
+            return self.load();
+        }
+
+        let config = AppConfig::default();
+        self.save(&config)?;
+        Ok(config)
+    }
+
+    pub fn save(&self, config: &AppConfig) -> Result<(), ConfigStoreError> {
+        validate_schema(config)?;
+
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut bytes = serde_json::to_vec_pretty(config)?;
+        bytes.push(b'\n');
+        fs::write(&self.path, bytes)?;
+
+        Ok(())
+    }
+}
+
+pub fn default_config_path() -> Result<PathBuf, ConfigStoreError> {
+    let base_dirs = BaseDirs::new().ok_or(ConfigStoreError::LocalDataDirectoryUnavailable)?;
+
+    Ok(base_dirs
+        .data_local_dir()
+        .join("FXDK Agent")
+        .join("config.json"))
+}
+
+fn validate_schema(config: &AppConfig) -> Result<(), ConfigStoreError> {
+    if config.schema_version != CONFIG_SCHEMA_VERSION {
+        return Err(ConfigStoreError::UnsupportedSchema {
+            found: config.schema_version,
+            supported: CONFIG_SCHEMA_VERSION,
+        });
+    }
+
+    Ok(())
+}
+
 impl AppConfig {
     pub fn apply_patch(&mut self, patch: ConfigPatch) {
         if let Some(server_project) = patch.server_project {
@@ -68,12 +186,21 @@ impl AppConfig {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{fs, path::PathBuf, process};
 
     use super::{
-        AppConfig, CONFIG_SCHEMA_VERSION, ConfigPatch, SyntheticIdentityConfig,
-        SyntheticIdentityPatch,
+        AppConfig, CONFIG_SCHEMA_VERSION, ConfigPatch, ConfigStore, ConfigStoreError,
+        SyntheticIdentityConfig, SyntheticIdentityPatch,
     };
+
+    fn test_store(name: &str) -> ConfigStore {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-config-test-{}-{name}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        ConfigStore::at(root.join("config.json"))
+    }
 
     #[test]
     fn default_config_is_schema_v1_and_dev_identity_is_disabled() {
@@ -124,5 +251,59 @@ mod tests {
         });
 
         assert_eq!(config.server_project, None);
+    }
+
+    #[test]
+    fn load_or_create_persists_default_config() {
+        let store = test_store("create-default");
+        let config = store.load_or_create().expect("create config");
+
+        assert_eq!(config, AppConfig::default());
+        assert!(store.path().is_file());
+
+        let reloaded = store.load().expect("reload config");
+        assert_eq!(reloaded, config);
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let store = test_store("round-trip");
+        let config = AppConfig {
+            server_project: Some(PathBuf::from(r"D:\server")),
+            fxserver_path: Some(PathBuf::from(r"D:\cfx\FXServer.exe")),
+            fivem_path: Some(PathBuf::from(r"C:\FiveM\FiveM.exe")),
+            synthetic_identity: SyntheticIdentityConfig { enabled: true },
+            ..AppConfig::default()
+        };
+
+        store.save(&config).expect("save config");
+        assert_eq!(store.load().expect("load config"), config);
+    }
+
+    #[test]
+    fn unsupported_schema_is_rejected() {
+        let store = test_store("unsupported-schema");
+        let parent = store.path().parent().expect("config parent");
+        fs::create_dir_all(parent).expect("create config parent");
+        fs::write(
+            store.path(),
+            br#"{
+  "schemaVersion": 999,
+  "serverProject": null,
+  "fxserverPath": null,
+  "fivemPath": null,
+  "syntheticIdentity": { "enabled": false }
+}"#,
+        )
+        .expect("write unsupported config");
+
+        let error = store.load().expect_err("schema must fail");
+        assert!(matches!(
+            error,
+            ConfigStoreError::UnsupportedSchema {
+                found: 999,
+                supported: CONFIG_SCHEMA_VERSION
+            }
+        ));
     }
 }

@@ -6,15 +6,19 @@ use std::{
 
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
     pub schema_version: u32,
+    #[schema(value_type = Option<String>)]
     pub server_project: Option<PathBuf>,
+    #[schema(value_type = Option<String>)]
     pub fxserver_path: Option<PathBuf>,
+    #[schema(value_type = Option<String>)]
     pub fivem_path: Option<PathBuf>,
     pub synthetic_identity: SyntheticIdentityConfig,
 }
@@ -31,20 +35,23 @@ impl Default for AppConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SyntheticIdentityConfig {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigPatch {
     #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schema(value_type = Option<String>)]
     pub server_project: Option<Option<PathBuf>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schema(value_type = Option<String>)]
     pub fxserver_path: Option<Option<PathBuf>>,
     #[serde(default, deserialize_with = "deserialize_double_option")]
+    #[schema(value_type = Option<String>)]
     pub fivem_path: Option<Option<PathBuf>>,
     pub synthetic_identity: Option<SyntheticIdentityPatch>,
 }
@@ -59,13 +66,13 @@ where
     Option::<T>::deserialize(deserializer).map(Some)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SyntheticIdentityPatch {
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigValidationIssue {
     pub field: String,

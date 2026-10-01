@@ -970,6 +970,7 @@ dependencies = [
  "directories",
  "serde",
  "serde_json",
+ "utoipa",
 ]
 
 [[package]]
@@ -977,6 +978,7 @@ name = "fxdk-agent-control-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "fxdk-agent-config",
  "serde",
  "serde_json",
  "tokio",
@@ -996,6 +998,7 @@ dependencies = [
 name = "fxdk-agent-host"
 version = "0.1.0"
 dependencies = [
+ "fxdk-agent-config",
  "fxdk-agent-control-api",
  "tokio",
 ]

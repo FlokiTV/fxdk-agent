@@ -2,24 +2,76 @@ use std::{
     future::Future,
     io,
     net::{Ipv4Addr, SocketAddr},
+    sync::Arc,
 };
 
 use axum::{
     Json, Router,
-    http::header,
+    extract::State,
+    http::{StatusCode, header},
     response::IntoResponse,
     routing::get,
 };
+use fxdk_agent_config::{
+    AppConfig, ConfigPatch, ConfigStore, ConfigStoreError, ConfigValidationIssue,
+    SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
+};
 use serde::{Deserialize, Serialize};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::RwLock};
 use utoipa::{OpenApi, ToSchema};
 
 pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
+
+#[derive(Clone)]
+pub struct ControlApiState {
+    config: Arc<RwLock<AppConfig>>,
+    store: Option<ConfigStore>,
+}
+
+impl ControlApiState {
+    pub fn in_memory(config: AppConfig) -> Self {
+        Self {
+            config: Arc::new(RwLock::new(config)),
+            store: None,
+        }
+    }
+
+    pub fn from_store(store: ConfigStore) -> Result<Self, ConfigStoreError> {
+        let config = store.load_or_create()?;
+
+        Ok(Self {
+            config: Arc::new(RwLock::new(config)),
+            store: Some(store),
+        })
+    }
+
+    pub async fn config_snapshot(&self) -> AppConfig {
+        self.config.read().await.clone()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
     pub ok: bool,
     pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApiErrorResponse {
+    pub ok: bool,
+    pub error: ApiErrorDetail,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApiErrorDetail {
+    pub code: String,
+    pub message: String,
+    pub detail: Option<ApiErrorContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct ApiErrorContext {
+    pub issues: Vec<ConfigValidationIssue>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -125,18 +177,37 @@ pub async fn bind_default() -> io::Result<TcpListener> {
 }
 
 pub fn router() -> Router {
+    router_with_state(ControlApiState::in_memory(AppConfig::default()))
+}
+
+pub fn router_with_state(state: ControlApiState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
         .route("/openapi.json", get(openapi))
+        .with_state(state)
 }
 
 pub async fn serve(
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> io::Result<()> {
-    axum::serve(listener, router())
+    serve_with_state(
+        listener,
+        ControlApiState::in_memory(AppConfig::default()),
+        shutdown,
+    )
+    .await
+}
+
+pub async fn serve_with_state(
+    listener: TcpListener,
+    state: ControlApiState,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> io::Result<()> {
+    axum::serve(listener, router_with_state(state))
         .with_graceful_shutdown(shutdown)
         .await
 }
@@ -162,6 +233,80 @@ async fn status() -> Json<ControlStatus> {
     Json(ControlStatus::initial())
 }
 
+type ConfigHandlerError = (StatusCode, Json<ApiErrorResponse>);
+
+#[utoipa::path(
+    get,
+    path = "/v1/config",
+    responses((status = 200, description = "Sanitized local configuration", body = AppConfig))
+)]
+async fn get_config(State(state): State<ControlApiState>) -> Json<AppConfig> {
+    Json(state.config_snapshot().await)
+}
+
+#[utoipa::path(
+    patch,
+    path = "/v1/config",
+    request_body = ConfigPatch,
+    responses(
+        (status = 200, description = "Updated local configuration", body = AppConfig),
+        (status = 422, description = "Configuration validation failed", body = ApiErrorResponse),
+        (status = 500, description = "Configuration persistence failed", body = ApiErrorResponse)
+    )
+)]
+async fn patch_config(
+    State(state): State<ControlApiState>,
+    Json(patch): Json<ConfigPatch>,
+) -> Result<Json<AppConfig>, ConfigHandlerError> {
+    let mut current = state.config.write().await;
+    let mut candidate = current.clone();
+    candidate.apply_patch(patch);
+
+    let issues = validate_runtime_paths(&candidate);
+    if !issues.is_empty() {
+        return Err(config_validation_error(issues));
+    }
+
+    if let Some(store) = &state.store
+        && store.save(&candidate).is_err()
+    {
+        return Err(config_persistence_error());
+    }
+
+    *current = candidate.clone();
+    Ok(Json(candidate))
+}
+
+fn config_validation_error(
+    issues: Vec<ConfigValidationIssue>,
+) -> ConfigHandlerError {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "CONFIG_VALIDATION_FAILED".to_owned(),
+                message: "configuration contains invalid runtime paths".to_owned(),
+                detail: Some(ApiErrorContext { issues }),
+            },
+        }),
+    )
+}
+
+fn config_persistence_error() -> ConfigHandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "CONFIG_PERSIST_FAILED".to_owned(),
+                message: "failed to persist local configuration".to_owned(),
+                detail: None,
+            },
+        }),
+    )
+}
+
 #[utoipa::path(
     get,
     path = "/agent.md",
@@ -176,9 +321,17 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, agent_guide),
+    paths(health, status, get_config, patch_config, agent_guide),
     components(schemas(
         HealthResponse,
+        ApiErrorResponse,
+        ApiErrorDetail,
+        ApiErrorContext,
+        AppConfig,
+        ConfigPatch,
+        ConfigValidationIssue,
+        SyntheticIdentityConfig,
+        SyntheticIdentityPatch,
         LauncherState,
         ServerState,
         ClientState,
@@ -207,7 +360,9 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
-    use std::net::Ipv4Addr;
+    use std::{fs, net::Ipv4Addr, process};
+
+    use fxdk_agent_config::{AppConfig, ConfigStore};
 
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -217,9 +372,18 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AgentState, ControlStatus, HealthResponse, LauncherState, ServerState,
-        default_control_addr, router, serve,
+        AgentState, ApiErrorResponse, ControlApiState, ControlStatus, HealthResponse,
+        LauncherState, ServerState, default_control_addr, router, router_with_state, serve,
     };
+
+    fn test_config_store(name: &str) -> ConfigStore {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-control-api-test-{}-{name}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        ConfigStore::at(root.join("config.json"))
+    }
 
     #[test]
     fn default_address_is_loopback_only() {
@@ -329,7 +493,123 @@ mod tests {
         assert_eq!(document["info"]["title"], "FXDK Agent Control API");
         assert!(document["paths"]["/v1/health"]["get"].is_object());
         assert!(document["paths"]["/v1/status"]["get"].is_object());
+        assert!(document["paths"]["/v1/config"]["get"].is_object());
+        assert!(document["paths"]["/v1/config"]["patch"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn config_get_returns_sanitized_default_contract() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/config")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("config response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("config body");
+        let config: AppConfig = serde_json::from_slice(&body).expect("config json");
+
+        assert_eq!(config, AppConfig::default());
+    }
+
+    #[tokio::test]
+    async fn config_patch_persists_valid_runtime_paths() {
+        let store = test_config_store("valid-patch");
+        let root = store.path().parent().expect("test root");
+        let server_project = root.join("server");
+        let fxserver_path = root.join("FXServer.exe");
+        let fivem_path = root.join("FiveM.exe");
+
+        fs::create_dir_all(&server_project).expect("create server project");
+        fs::write(&fxserver_path, b"test").expect("create fxserver");
+        fs::write(&fivem_path, b"test").expect("create fivem");
+
+        let state = ControlApiState::from_store(store.clone()).expect("load state");
+        let patch = serde_json::json!({
+            "serverProject": server_project,
+            "fxserverPath": fxserver_path,
+            "fivemPath": fivem_path,
+            "syntheticIdentity": { "enabled": true }
+        });
+
+        let response = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("patch body");
+        let updated: AppConfig = serde_json::from_slice(&body).expect("updated config");
+
+        assert!(updated.synthetic_identity.enabled);
+        assert_eq!(store.load().expect("persisted config"), updated);
+    }
+
+    #[tokio::test]
+    async fn config_patch_rejects_invalid_paths_without_persisting() {
+        let store = test_config_store("invalid-patch");
+        let state = ControlApiState::from_store(store.clone()).expect("load state");
+        let missing = store
+            .path()
+            .parent()
+            .expect("test root")
+            .join("missing-server");
+
+        let patch = serde_json::json!({
+            "serverProject": missing
+        });
+
+        let response = router_with_state(state)
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/v1/config")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(patch.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("patch response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("error body");
+        let error: ApiErrorResponse = serde_json::from_slice(&body).expect("error json");
+
+        assert!(!error.ok);
+        assert_eq!(error.error.code, "CONFIG_VALIDATION_FAILED");
+        assert_eq!(
+            error
+                .error
+                .detail
+                .expect("validation detail")
+                .issues
+                .first()
+                .expect("validation issue")
+                .field,
+            "serverProject"
+        );
+        assert_eq!(store.load().expect("persisted config"), AppConfig::default());
     }
 
     #[tokio::test]

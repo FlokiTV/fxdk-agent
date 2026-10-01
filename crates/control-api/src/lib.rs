@@ -4,7 +4,12 @@ use std::{
     net::{Ipv4Addr, SocketAddr},
 };
 
-use axum::{Json, Router, routing::get};
+use axum::{
+    Json, Router,
+    http::header,
+    response::IntoResponse,
+    routing::get,
+};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
@@ -122,6 +127,7 @@ pub fn router() -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route("/agent.md", get(agent_guide))
 }
 
 pub async fn serve(
@@ -144,11 +150,18 @@ async fn status() -> Json<ControlStatus> {
     Json(ControlStatus::initial())
 }
 
+async fn agent_guide() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
+        include_str!("../../../agent/agent.md"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use axum::{
         body::{Body, to_bytes},
-        http::{Request, StatusCode},
+        http::{Request, StatusCode, header},
     };
     use tower::ServiceExt;
 
@@ -212,5 +225,33 @@ mod tests {
         assert!(payload.clients.is_empty());
         assert!(!payload.agent.enabled);
         assert_eq!(payload.agent.state, AgentState::Disabled);
+    }
+
+    #[tokio::test]
+    async fn agent_guide_is_served_as_markdown() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/agent.md")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("agent guide response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&"text/markdown; charset=utf-8".parse().expect("content type"))
+        );
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("agent guide body");
+        let text = String::from_utf8(body.to_vec()).expect("agent guide utf8");
+
+        assert!(text.contains("# FXDK Agent — Agent Guide"));
+        assert!(text.contains("GET /v1/status"));
+        assert!(text.contains("GET /openapi.json"));
     }
 }

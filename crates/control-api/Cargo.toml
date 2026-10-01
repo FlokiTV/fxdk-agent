@@ -13,6 +13,7 @@ workspace = true
 axum.workspace = true
 serde.workspace = true
 tokio.workspace = true
+utoipa.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

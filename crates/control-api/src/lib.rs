@@ -12,16 +12,17 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use utoipa::{OpenApi, ToSchema};
 
 pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct HealthResponse {
     pub ok: bool,
     pub version: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum LauncherState {
     Starting,
@@ -30,7 +31,7 @@ pub enum LauncherState {
     Error,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ServerState {
     Stopped,
@@ -40,7 +41,7 @@ pub enum ServerState {
     Crashed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientState {
     Stopped,
@@ -51,7 +52,7 @@ pub enum ClientState {
     Crashed,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentState {
     Disabled,
@@ -60,33 +61,33 @@ pub enum AgentState {
     Error,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct LauncherStatus {
     pub state: LauncherState,
     pub pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ServerStatus {
     pub state: ServerState,
     pub address: Option<String>,
     pub pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ClientStatus {
     pub id: u32,
     pub state: ClientState,
     pub pid: Option<u32>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct AgentStatus {
     pub enabled: bool,
     pub state: AgentState,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ControlStatus {
     pub launcher: LauncherStatus,
     pub server: ServerStatus,
@@ -128,6 +129,7 @@ pub fn router() -> Router {
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
         .route("/agent.md", get(agent_guide))
+        .route("/openapi.json", get(openapi))
 }
 
 pub async fn serve(
@@ -139,6 +141,11 @@ pub async fn serve(
         .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/health",
+    responses((status = 200, description = "Control API health", body = HealthResponse))
+)]
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         ok: true,
@@ -146,15 +153,52 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/status",
+    responses((status = 200, description = "Current control plane state", body = ControlStatus))
+)]
 async fn status() -> Json<ControlStatus> {
     Json(ControlStatus::initial())
 }
 
+#[utoipa::path(
+    get,
+    path = "/agent.md",
+    responses((status = 200, description = "Agent-oriented discovery guide"))
+)]
 async fn agent_guide() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/markdown; charset=utf-8")],
         include_str!("../../../agent/agent.md"),
     )
+}
+
+#[derive(OpenApi)]
+#[openapi(
+    paths(health, status, agent_guide),
+    components(schemas(
+        HealthResponse,
+        LauncherState,
+        ServerState,
+        ClientState,
+        AgentState,
+        LauncherStatus,
+        ServerStatus,
+        ClientStatus,
+        AgentStatus,
+        ControlStatus
+    )),
+    info(
+        title = "FXDK Agent Control API",
+        version = "0.1.0",
+        description = "Local loopback control plane for FXDK Agent."
+    )
+)]
+struct ApiDoc;
+
+async fn openapi() -> Json<utoipa::openapi::OpenApi> {
+    Json(ApiDoc::openapi())
 }
 
 #[cfg(test)]
@@ -253,5 +297,31 @@ mod tests {
         assert!(text.contains("# FXDK Agent — Agent Guide"));
         assert!(text.contains("GET /v1/status"));
         assert!(text.contains("GET /openapi.json"));
+    }
+
+    #[tokio::test]
+    async fn openapi_route_describes_discovery_endpoints() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/openapi.json")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("openapi response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("openapi body");
+        let document: serde_json::Value =
+            serde_json::from_slice(&body).expect("openapi json");
+
+        assert_eq!(document["info"]["title"], "FXDK Agent Control API");
+        assert!(document["paths"]["/v1/health"]["get"].is_object());
+        assert!(document["paths"]["/v1/status"]["get"].is_object());
+        assert!(document["paths"]["/agent.md"]["get"].is_object());
     }
 }

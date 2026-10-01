@@ -8,6 +8,7 @@ use std::{
 };
 
 use fxdk_agent_config::AppConfig;
+use fxdk_agent_dev_identity::SyntheticDevIdentity;
 use fxdk_agent_process_supervisor::{
     ProcessPhase, ProcessSpec, ProcessSupervisor,
 };
@@ -20,6 +21,11 @@ use tokio::{
 const DEFAULT_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Default)]
+pub struct FxServerStartOptions {
+    pub synthetic_identity: Option<SyntheticDevIdentity>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FxServerPhase {
@@ -134,6 +140,15 @@ impl FxServerController {
         &self,
         config: &AppConfig,
     ) -> Result<FxServerSnapshot, FxServerError> {
+        self.start_with_options(config, FxServerStartOptions::default())
+            .await
+    }
+
+    pub async fn start_with_options(
+        &self,
+        config: &AppConfig,
+        options: FxServerStartOptions,
+    ) -> Result<FxServerSnapshot, FxServerError> {
         let _operation = self.operation.lock().await;
         self.reconcile().await;
 
@@ -144,7 +159,7 @@ impl FxServerController {
             }
         }
 
-        let spec = build_fxserver_spec(config)?;
+        let spec = build_fxserver_spec_with_options(config, &options)?;
 
         {
             let mut state = self.state.write().await;
@@ -284,6 +299,13 @@ impl FxServerController {
 }
 
 pub fn build_fxserver_spec(config: &AppConfig) -> Result<ProcessSpec, FxServerError> {
+    build_fxserver_spec_with_options(config, &FxServerStartOptions::default())
+}
+
+pub fn build_fxserver_spec_with_options(
+    config: &AppConfig,
+    options: &FxServerStartOptions,
+) -> Result<ProcessSpec, FxServerError> {
     let server_project = required_server_project(config)?;
     let fxserver_path = required_fxserver_path(config)?;
     let server_cfg = server_project.join("server.cfg");
@@ -292,18 +314,7 @@ pub fn build_fxserver_spec(config: &AppConfig) -> Result<ProcessSpec, FxServerEr
         return Err(FxServerError::MissingServerConfig(server_cfg));
     }
 
-    let args: Vec<OsString> = [
-        "+set",
-        "sv_lan",
-        "1",
-        "+set",
-        "onesync",
-        "on",
-        "+set",
-        "sv_fxdkMode",
-        "1",
-        "+exec",
-        "server.cfg",
+    let mut args: Vec<OsString> = [
         "+set",
         "sv_lan",
         "1",
@@ -318,9 +329,39 @@ pub fn build_fxserver_spec(config: &AppConfig) -> Result<ProcessSpec, FxServerEr
     .map(OsString::from)
     .collect();
 
+    append_identity_convars(&mut args, options.synthetic_identity.as_ref());
+
+    args.extend(
+        ["+exec", "server.cfg", "+set", "sv_lan", "1", "+set", "onesync", "on", "+set", "sv_fxdkMode", "1"]
+            .into_iter()
+            .map(OsString::from),
+    );
+
+    append_identity_convars(&mut args, options.synthetic_identity.as_ref());
+
     Ok(ProcessSpec::new(fxserver_path)
         .args(args)
         .current_dir(server_project))
+}
+
+fn append_identity_convars(
+    args: &mut Vec<OsString>,
+    identity: Option<&SyntheticDevIdentity>,
+) {
+    let Some(identity) = identity else {
+        return;
+    };
+
+    for (name, value) in [
+        ("fxdk_agent_dev_identity", "1".to_owned()),
+        ("fxdk_agent_dev_slot", identity.slot.to_string()),
+        ("fxdk_agent_dev_license", identity.payload.clone()),
+        ("fxdk_agent_dev_license2", identity.payload.clone()),
+    ] {
+        args.push(OsString::from("+set"));
+        args.push(OsString::from(name));
+        args.push(OsString::from(value));
+    }
 }
 
 fn required_server_project(config: &AppConfig) -> Result<&Path, FxServerError> {
@@ -350,9 +391,11 @@ mod tests {
     use std::{fs, path::PathBuf, process, time::Duration};
 
     use fxdk_agent_config::AppConfig;
+    use fxdk_agent_dev_identity::SyntheticDevIdentity;
 
     use super::{
-        FxServerError, build_fxserver_spec,
+        FxServerError, FxServerStartOptions, build_fxserver_spec,
+        build_fxserver_spec_with_options,
     };
 
     #[test]
@@ -422,6 +465,64 @@ mod tests {
         }));
         assert!(args.windows(2).any(|window| {
             window == ["+exec", "server.cfg"]
+        }));
+        assert!(!args.iter().any(|arg| arg == "fxdk_agent_dev_license"));
+    }
+
+    #[test]
+    fn launch_spec_exposes_synthetic_identity_as_dev_convars() {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-fxserver-identity-spec-{}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("server-data");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(project.join("server.cfg"), b"# test").expect("server cfg");
+        let executable = root.join("FXServer.exe");
+        fs::write(&executable, b"test").expect("fake executable");
+
+        let config = AppConfig {
+            server_project: Some(project),
+            fxserver_path: Some(executable),
+            synthetic_identity: fxdk_agent_config::SyntheticIdentityConfig {
+                enabled: true,
+            },
+            ..AppConfig::default()
+        };
+        let identity = SyntheticDevIdentity {
+            slot: 1,
+            payload: "deadbeef00000001112233445566778899aabbcc".to_owned(),
+        };
+
+        let spec = build_fxserver_spec_with_options(
+            &config,
+            &FxServerStartOptions {
+                synthetic_identity: Some(identity.clone()),
+            },
+        )
+        .expect("build identity spec");
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        for name in [
+            "fxdk_agent_dev_identity",
+            "fxdk_agent_dev_slot",
+            "fxdk_agent_dev_license",
+            "fxdk_agent_dev_license2",
+        ] {
+            assert_eq!(
+                args.iter().filter(|arg| arg.as_str() == name).count(),
+                2,
+                "{name} must be applied before and after server.cfg"
+            );
+        }
+
+        assert!(args.windows(2).any(|window| {
+            window[0] == "fxdk_agent_dev_license" && window[1] == identity.payload
         }));
     }
 }

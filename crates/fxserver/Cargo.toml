@@ -11,5 +11,6 @@ workspace = true
 
 [dependencies]
 fxdk-agent-config = { path = "../config" }
+fxdk-agent-dev-identity = { path = "../dev-identity" }
 fxdk-agent-process-supervisor = { path = "../process-supervisor" }
 tokio.workspace = true

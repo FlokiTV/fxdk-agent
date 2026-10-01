@@ -2,6 +2,8 @@ import type {
   ApiErrorResponse,
   AppConfig,
   ConfigPatch,
+  ControlStatus,
+  SessionStartRequest,
 } from '@fxdk-agent/protocol';
 
 export const CONTROL_API_BASE_URL = 'http://127.0.0.1:35418';
@@ -51,6 +53,25 @@ async function requestJson<T>(
   }
 
   return (await response.json()) as T;
+}
+
+export function getStatus(): Promise<ControlStatus> {
+  return requestJson<ControlStatus>('/v1/status');
+}
+
+export function startSession(
+  request: SessionStartRequest = { clients: 1 },
+): Promise<ControlStatus> {
+  return requestJson<ControlStatus>('/v1/session/start', {
+    method: 'POST',
+    body: JSON.stringify(request),
+  });
+}
+
+export function stopSession(): Promise<ControlStatus> {
+  return requestJson<ControlStatus>('/v1/session/stop', {
+    method: 'POST',
+  });
 }
 
 export function getConfig(): Promise<AppConfig> {

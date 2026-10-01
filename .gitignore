@@ -1,0 +1,51 @@
+# Local agent/workspace state
+AGENT_CONTEXT.md
+*.local.json
+*.local.toml
+*.local.yaml
+*.local.yml
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Rust
+target/
+**/target/
+
+# JavaScript / TypeScript
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+.turbo/
+.vite/
+
+# Tauri / tooling
+src-tauri/target/
+
+# Logs and runtime state
+*.log
+logs/
+.runtime/
+.tmp/
+tmp/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Test / coverage
+coverage/
+.coverage/
+
+# Generated binaries
+*.exe
+*.dll
+*.pdb

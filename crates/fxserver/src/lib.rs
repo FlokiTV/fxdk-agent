@@ -347,7 +347,7 @@ fn required_fxserver_path(config: &AppConfig) -> Result<&Path, FxServerError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process};
+    use std::{fs, path::PathBuf, process, time::Duration};
 
     use fxdk_agent_config::AppConfig;
 
@@ -360,6 +360,33 @@ mod tests {
         let error = build_fxserver_spec(&AppConfig::default())
             .expect_err("missing project must fail");
         assert!(matches!(error, FxServerError::MissingServerProject));
+    }
+
+    #[tokio::test]
+    async fn early_process_exit_becomes_crashed_state() {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-fxserver-crash-{}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("server-data");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(project.join("server.cfg"), b"# test").expect("server cfg");
+
+        let config = AppConfig {
+            server_project: Some(project),
+            fxserver_path: Some(PathBuf::from(r"C:\Windows\System32\cmd.exe")),
+            server_address: "127.0.0.1:65534".to_owned(),
+            ..AppConfig::default()
+        };
+        let controller = super::FxServerController::new(Duration::from_secs(3));
+
+        let error = controller.start(&config).await.expect_err("start must fail");
+        assert!(matches!(error, FxServerError::EarlyExit(_)));
+
+        let snapshot = controller.snapshot().await;
+        assert_eq!(snapshot.phase, super::FxServerPhase::Crashed);
+        assert!(snapshot.last_error.is_some());
     }
 
     #[test]

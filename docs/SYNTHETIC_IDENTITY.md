@@ -1,105 +1,229 @@
 # Synthetic Development Identity
 
-## Purpose
+## Status
 
-FiveM/FxDK GameRuntime sessions may not expose the same Rockstar-backed identifiers that a normal FiveM client exposes. Development servers often still expect `license` or `license2`, which otherwise forces every test server to implement an FXDK-specific fallback.
+The MVP implementation now provides a deterministic, development-only identity owned by FXDK Agent.
 
-FXDK Agent should provide a development-only identity layer so ordinary server code can keep using its normal identifier path.
+It does **not** currently inject `license` or `license2` into FXServer's native player identifier list. Runtime validation confirmed that FxDK connections still expose only the native identifiers provided by Cfx itself.
 
-## Target behavior
+This distinction is intentional and documented explicitly.
 
-For a local FXDK Agent session, a normal resource should be able to read identifiers and observe values such as:
+## Current contract
 
-```text
-license:deadbeef00000001aabbccddeeff001122334455
-license2:deadbeef00000001aabbccddeeff001122334455
-```
+When synthetic identity is enabled, FXDK Agent derives one identity per client slot.
 
-The payload remains 40 hexadecimal characters for compatibility with common validation logic, while the `deadbeef` prefix makes the value visibly development-only in logs and databases.
-
-`deadbeef` is an FXDK Agent project convention. It is not an official Cfx.re or Rockstar identifier namespace.
-
-## Determinism
-
-Synthetic identities should be stable across restarts of the same local development installation and distinct across client slots.
-
-Proposed conceptual layout:
+The payload is exactly 40 lowercase hexadecimal characters:
 
 ```text
-deadbeef + 8-hex client slot + 24 hex derived from local dev seed
+deadbeef + 8-hex client slot + 24 derived hex characters
 ```
 
-Examples:
+Example shape:
 
 ```text
-slot 1: deadbeef00000001aabbccddeeff001122334455
-slot 2: deadbeef00000002aabbccddeeff001122334455
+deadbeef00000001aabbccddeeff001122334455
 ```
 
-The production implementation should derive the tail from a random local development seed generated once and stored in user configuration. It should not fingerprint hardware just to produce a stable ID.
-
-A versioned derivation is preferred, for example conceptually:
+The same payload is exposed conceptually as both:
 
 ```text
-sha256("fxdk-agent:dev-license:v1" + localSeed + clientSlot)
+license:<payload>
+license2:<payload>
 ```
 
-Only the required hexadecimal portion would be embedded after the visible DEV prefix and slot.
+The `deadbeef` prefix is an FXDK Agent convention. It is not an official Rockstar or Cfx.re namespace.
 
-## Compatibility goal
+## Derivation
 
-The preferred implementation makes the synthetic identifiers visible through the same server-side identifier surface used by ordinary resources, including Lua, JavaScript/TypeScript, and C# consumers.
+The implementation uses a versioned namespace and a private local seed.
 
-The target is:
+Conceptually:
+
+```text
+digest = SHA-256(
+  "fxdk-agent/dev-identity/v1"
+  + localSeed
+  + clientSlot
+)
+
+payload =
+  "deadbeef"
+  + slot as 8 lowercase hex characters
+  + first 24 hex characters derived from digest
+```
+
+Properties:
+
+- deterministic for the same local seed and client slot;
+- different across client slots;
+- exactly 40 lowercase hexadecimal characters;
+- visibly development-only;
+- independent of process IDs, ports, usernames, or hardware fingerprints.
+
+## Local seed
+
+The seed is generated from the operating system random source and persisted separately from the public app configuration.
+
+On Windows the default store is:
+
+```text
+%LOCALAPPDATA%\FXDK Agent\identity.json
+```
+
+The seed is not exposed through the Control API or frontend configuration contract.
+
+Resetting the identity store rotates the seed and therefore changes all derived local development identities. Any local database rows keyed by the previous synthetic identifiers will no longer refer to the new identities after a reset.
+
+## FXServer transport
+
+When `syntheticIdentity.enabled` is `true`, `POST /v1/server/start` resolves the identity for client slot 1 and passes it to the managed FXServer launch.
+
+The following development-only convars are applied both before and after `server.cfg`:
+
+```text
+fxdk_agent_dev_identity = 1
+fxdk_agent_dev_slot     = 1
+fxdk_agent_dev_license  = <40-hex payload>
+fxdk_agent_dev_license2 = <40-hex payload>
+```
+
+Applying them again after `server.cfg` prevents an unrelated server config value from silently replacing the session identity.
+
+The FXServer controller also enforces the existing local development launch contract:
+
+```text
+sv_lan = 1
+sv_fxdkMode = 1
+```
+
+The configured server address is validated as loopback-only before it can be persisted.
+
+## Runtime validation
+
+The MVP was validated with a temporary FXServer project containing independent Lua and JavaScript observer resources.
+
+With synthetic identity enabled, both runtimes observed the same stable convars:
+
+```text
+enabled=1
+slot=1
+license=<deadbeef... payload>
+license2=<same deadbeef... payload>
+```
+
+A real FxDK client then connected and reached the active connection state.
+
+### Lua native identifier result
+
+The Lua resource observed:
+
+```text
+GetPlayerIdentifiers(source)
+=> ["ip:127.0.0.1"]
+
+GetPlayerIdentifierByType(source, "license")
+=> nil
+
+GetPlayerIdentifierByType(source, "license2")
+=> nil
+```
+
+### JavaScript native identifier result
+
+The JavaScript resource enumerated identifiers through:
+
+```text
+GetNumPlayerIdentifiers(source)
+GetPlayerIdentifier(source, index)
+```
+
+and observed:
+
+```text
+["ip:127.0.0.1"]
+```
+
+No native `license:` or `license2:` entry was present.
+
+The client still reached:
+
+```text
+gameProcessState = 2
+connectionState = 8
+client state = active
+```
+
+so the missing identifiers are an identity-layer limitation, not a failed client connection.
+
+## Native injection limitation
+
+FXServer's scripting runtimes consume the identifier list supplied by the server connection/identity layer. The current FxDK connection does not populate Rockstar-backed `license` / `license2` identifiers, and the normal Lua or JavaScript scripting surface does not provide a supported operation for inserting arbitrary entries into that native list.
+
+Therefore the current MVP does **not** claim that the development convars are native player identifiers.
+
+In particular, this project does not describe any of the following as equivalent to native injection:
+
+- monkey-patching only Lua helpers;
+- adding a JavaScript wrapper around identifier reads;
+- asking each target base to implement an FXDK-specific fallback;
+- patching the FiveM or FXServer binary.
+
+## Compatibility policy
+
+The long-term target remains zero target-base adaptations:
 
 ```text
 FXDK Agent
-    -> synthetic connection identity
-    -> FXServer
-    -> normal identifier APIs
-    -> arbitrary server resources
+    -> connection-level synthetic identity
+    -> FXServer native identifier list
+    -> ordinary Lua / JS / C# identifier APIs
 ```
 
-A target server should not need application-specific code such as `if fxdk then useFallbackLicense()`.
+Reaching that target requires a supported connection/provider hook from Cfx/FxDK or a maintainable native extension point that can populate the server identity list before resources observe the player.
 
-If the Cfx/FxDK runtime does not expose a supported native injection point, the project may temporarily use an automatically mounted compatibility resource. Such a fallback must be documented as compatibility mode and must not be presented as equivalent to a true connection-level identifier.
+Until such a path is implemented and validated across Lua, JavaScript/TypeScript, and C#, FXDK Agent exposes its deterministic identity through the development convars above and documents native identifier injection as unavailable.
 
-## `license` and `license2`
+The project does not ship a runtime-specific monkey patch as if it solved the native identity problem.
 
-For local development compatibility, the initial design may expose the same synthetic payload for both `license` and `license2`. This avoids making server projects care which identifier a GameRuntime session happened to omit.
+## Existing project fallbacks
 
-The exact behavior remains subject to validation against supported Cfx/FxDK runtime contracts.
+A target project may temporarily have its own DEV-only fallback while this native injection gap exists.
 
-## Guardrails
+For example, a TypeScript core can explicitly read a configured local development identity when all of the following are true:
 
-Synthetic identity must be fail-closed and development-only.
+- development mode is active;
+- LAN/FxDK mode is active;
+- the connection is local;
+- the fallback is explicitly enabled.
 
-Required guards:
+Such target-project logic is compatibility scaffolding, not the final FXDK Agent identity architecture, and should be removable once a true connection-level solution exists.
 
-- explicit opt-in in FXDK Agent configuration;
-- local/loopback session only;
-- FXDK/development mode only;
-- never claim to be a real Rockstar, Cfx.re, Steam, Discord, or other third-party identity;
-- never copy a real user's license value into generated identities;
-- never enable synthetic identity silently on a public/production server.
+## Security boundaries
 
-## Multi-client testing
+Synthetic identity is development-only.
 
-Each client slot should receive a stable, distinct identity. This allows databases, permissions systems, character systems, and session layers to behave as if separate development players connected.
+Required boundaries:
+
+- explicit opt-in through FXDK Agent configuration;
+- loopback server address;
+- `sv_lan=1`;
+- `sv_fxdkMode=1`;
+- no attempt to impersonate a real Rockstar, Cfx.re, Steam, Discord, or other identity;
+- no copying of a real user's license value;
+- no hardware fingerprinting solely to manufacture a stable identifier;
+- no silent use against public or production servers.
+
+## Multi-client direction
+
+The derivation already supports stable identities for arbitrary positive client slots:
 
 ```text
 local seed
    |
-   +-- slot 1 -> DEV license A
-   +-- slot 2 -> DEV license B
-   +-- slot 3 -> DEV license C
-   +-- slot N -> DEV license N
+   +-- slot 1 -> DEV identity A
+   +-- slot 2 -> DEV identity B
+   +-- slot 3 -> DEV identity C
+   +-- slot N -> DEV identity N
 ```
 
-## Database visibility
-
-Because the value is intentionally recognizable, accidental persistence into a development database remains obvious. Consumers should still treat it as an opaque identifier; the `deadbeef` prefix is for operator visibility, not for application branching.
-
-## Open implementation question
-
-Before implementation, the project must determine the lowest supported Cfx/FxDK layer capable of exposing the identifier consistently to Lua, JavaScript/TypeScript, and C#. Binary patching of FiveM/FXServer is not the preferred starting point.
+The MVP currently manages one client. Multi-client lifecycle support can reuse the same derivation without changing the identity format.

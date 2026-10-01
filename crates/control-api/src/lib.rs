@@ -2,7 +2,11 @@ use std::{
     future::Future,
     io,
     net::{Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use axum::{
@@ -26,11 +30,57 @@ use fxdk_agent_fxserver::{
 };
 use fxdk_agent_runtime_web::materialize_sdk_root;
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::RwLock};
+use tokio::{
+    net::TcpListener,
+    sync::{Mutex, RwLock},
+    time::{Instant, sleep},
+};
 use tower_http::cors::CorsLayer;
 use utoipa::{OpenApi, ToSchema};
 
 pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
+const SESSION_CLIENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(90);
+const SESSION_CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum SessionState {
+    Stopped,
+    Starting,
+    Active,
+    Stopping,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionStatus {
+    pub id: Option<String>,
+    pub state: SessionState,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct SessionStartRequest {
+    pub clients: u32,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRuntimeState {
+    id: Option<String>,
+    state: SessionState,
+    last_error: Option<String>,
+}
+
+impl Default for SessionRuntimeState {
+    fn default() -> Self {
+        Self {
+            id: None,
+            state: SessionState::Stopped,
+            last_error: None,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct ControlApiState {
@@ -39,6 +89,9 @@ pub struct ControlApiState {
     identity_store: Option<DevIdentityStore>,
     fxserver: FxServerController,
     client: FivemClientController,
+    session: Arc<RwLock<SessionRuntimeState>>,
+    session_operation: Arc<Mutex<()>>,
+    session_counter: Arc<AtomicU64>,
 }
 
 impl ControlApiState {
@@ -49,6 +102,9 @@ impl ControlApiState {
             identity_store: None,
             fxserver: FxServerController::default(),
             client: FivemClientController::default(),
+            session: Arc::new(RwLock::new(SessionRuntimeState::default())),
+            session_operation: Arc::new(Mutex::new(())),
+            session_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -61,6 +117,9 @@ impl ControlApiState {
             identity_store: None,
             fxserver: FxServerController::default(),
             client: FivemClientController::default(),
+            session: Arc::new(RwLock::new(SessionRuntimeState::default())),
+            session_operation: Arc::new(Mutex::new(())),
+            session_counter: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -181,6 +240,7 @@ pub struct AgentStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct ControlStatus {
     pub launcher: LauncherStatus,
+    pub session: SessionStatus,
     pub server: ServerStatus,
     pub clients: Vec<ClientStatus>,
     pub agent: AgentStatus,
@@ -192,6 +252,11 @@ impl ControlStatus {
             launcher: LauncherStatus {
                 state: LauncherState::Ready,
                 pid: Some(std::process::id()),
+            },
+            session: SessionStatus {
+                id: None,
+                state: SessionState::Stopped,
+                last_error: None,
             },
             server: ServerStatus {
                 state: ServerState::Stopped,
@@ -226,6 +291,8 @@ pub fn router_with_state(state: ControlApiState) -> Router {
     Router::new()
         .route("/v1/health", get(health))
         .route("/v1/status", get(status))
+        .route("/v1/session/start", axum::routing::post(start_session))
+        .route("/v1/session/stop", axum::routing::post(stop_session))
         .route("/v1/server/start", axum::routing::post(start_server))
         .route("/v1/server/stop", axum::routing::post(stop_server))
         .route("/v1/client/start", axum::routing::post(start_client))
@@ -294,6 +361,7 @@ async fn status(State(state): State<ControlApiState>) -> Json<ControlStatus> {
 }
 
 async fn control_status(state: &ControlApiState) -> ControlStatus {
+    let session = state.session.read().await.clone();
     let server = state.fxserver.snapshot().await;
     let client = state.client.snapshot().await;
     let clients = if client.phase == FivemClientPhase::Stopped {
@@ -303,6 +371,11 @@ async fn control_status(state: &ControlApiState) -> ControlStatus {
     };
 
     ControlStatus {
+        session: SessionStatus {
+            id: session.id,
+            state: session.state,
+            last_error: session.last_error,
+        },
         server: server_status(server),
         clients,
         ..ControlStatus::initial()
@@ -348,6 +421,279 @@ fn server_status(snapshot: FxServerSnapshot) -> ServerStatus {
 
 type HandlerError = (StatusCode, Json<ApiErrorResponse>);
 type ConfigHandlerError = HandlerError;
+
+#[utoipa::path(
+    post,
+    path = "/v1/session/start",
+    request_body = SessionStartRequest,
+    responses(
+        (status = 200, description = "Session reached active state", body = ControlStatus),
+        (status = 409, description = "Session or managed runtime is already active", body = ApiErrorResponse),
+        (status = 422, description = "Session request or configuration is invalid", body = ApiErrorResponse),
+        (status = 500, description = "Session failed to start", body = ApiErrorResponse),
+        (status = 504, description = "Client did not reach active state in time", body = ApiErrorResponse)
+    )
+)]
+async fn start_session(
+    State(state): State<ControlApiState>,
+    Json(request): Json<SessionStartRequest>,
+) -> Result<Json<ControlStatus>, HandlerError> {
+    if request.clients != 1 {
+        return Err(session_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "SESSION_CLIENT_COUNT_UNSUPPORTED",
+            format!(
+                "MVP session orchestration supports exactly one client, got {}",
+                request.clients
+            ),
+        ));
+    }
+
+    let _operation = state.session_operation.lock().await;
+    ensure_session_startable(&state).await?;
+
+    let session_id = format!(
+        "session-{:08}",
+        state.session_counter.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    set_session_state(
+        &state,
+        Some(session_id),
+        SessionState::Starting,
+        None,
+    )
+    .await;
+
+    if let Err(error) = start_session_runtime(&state).await {
+        let message = error.1.0.error.message.clone();
+        rollback_session_runtime(&state).await;
+        let session_id = state.session.read().await.id.clone();
+        set_session_state(
+            &state,
+            session_id,
+            SessionState::Error,
+            Some(message),
+        )
+        .await;
+        return Err(error);
+    }
+
+    let session_id = state.session.read().await.id.clone();
+    set_session_state(&state, session_id, SessionState::Active, None).await;
+
+    Ok(Json(control_status(&state).await))
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/session/stop",
+    responses(
+        (status = 200, description = "Session stopped", body = ControlStatus),
+        (status = 500, description = "Session failed to stop cleanly", body = ApiErrorResponse)
+    )
+)]
+async fn stop_session(
+    State(state): State<ControlApiState>,
+) -> Result<Json<ControlStatus>, HandlerError> {
+    let _operation = state.session_operation.lock().await;
+
+    if state.session.read().await.state == SessionState::Stopped {
+        return Ok(Json(control_status(&state).await));
+    }
+
+    let session_id = state.session.read().await.id.clone();
+    set_session_state(&state, session_id, SessionState::Stopping, None).await;
+
+    let client_result = state.client.stop().await;
+    let server_result = state.fxserver.stop().await;
+
+    if let Err(error) = client_result {
+        let message = error.to_string();
+        let session_id = state.session.read().await.id.clone();
+        set_session_state(
+            &state,
+            session_id,
+            SessionState::Error,
+            Some(message.clone()),
+        )
+        .await;
+        return Err(session_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SESSION_CLIENT_STOP_FAILED",
+            message,
+        ));
+    }
+
+    if let Err(error) = server_result {
+        let message = error.to_string();
+        let session_id = state.session.read().await.id.clone();
+        set_session_state(
+            &state,
+            session_id,
+            SessionState::Error,
+            Some(message.clone()),
+        )
+        .await;
+        return Err(session_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SESSION_SERVER_STOP_FAILED",
+            message,
+        ));
+    }
+
+    set_session_state(&state, None, SessionState::Stopped, None).await;
+    Ok(Json(control_status(&state).await))
+}
+
+async fn ensure_session_startable(
+    state: &ControlApiState,
+) -> Result<(), HandlerError> {
+    let session = state.session.read().await;
+    if matches!(
+        session.state,
+        SessionState::Starting | SessionState::Active | SessionState::Stopping
+    ) {
+        return Err(session_error(
+            StatusCode::CONFLICT,
+            "SESSION_ALREADY_RUNNING",
+            "a managed session is already active or transitioning".to_owned(),
+        ));
+    }
+    drop(session);
+
+    let server = state.fxserver.snapshot().await;
+    if matches!(
+        server.phase,
+        FxServerPhase::Starting | FxServerPhase::Online | FxServerPhase::Stopping
+    ) {
+        return Err(session_error(
+            StatusCode::CONFLICT,
+            "SESSION_SERVER_BUSY",
+            "FXServer is already managed outside the session orchestrator".to_owned(),
+        ));
+    }
+
+    let client = state.client.snapshot().await;
+    if matches!(
+        client.phase,
+        FivemClientPhase::Starting
+            | FivemClientPhase::Connecting
+            | FivemClientPhase::Active
+            | FivemClientPhase::Stopping
+    ) {
+        return Err(session_error(
+            StatusCode::CONFLICT,
+            "SESSION_CLIENT_BUSY",
+            "FiveM/FxDK client is already managed outside the session orchestrator".to_owned(),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn start_session_runtime(
+    state: &ControlApiState,
+) -> Result<(), HandlerError> {
+    let config = state.config_snapshot().await;
+    let options = server_start_options(state, &config)?;
+
+    state
+        .fxserver
+        .start_with_options(&config, options)
+        .await
+        .map_err(server_start_error)?;
+
+    let sdk_root = match materialize_sdk_root() {
+        Ok(root) => root,
+        Err(error) => {
+            let _ = state.fxserver.stop().await;
+            return Err(client_runtime_prepare_error(error));
+        }
+    };
+
+    if let Err(error) = state.client.start(&config, &sdk_root).await {
+        let _ = state.fxserver.stop().await;
+        return Err(client_start_error(error));
+    }
+
+    if let Err(error) = wait_for_client_active(&state.client).await {
+        rollback_session_runtime(state).await;
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+async fn wait_for_client_active(
+    client: &FivemClientController,
+) -> Result<(), HandlerError> {
+    let deadline = Instant::now() + SESSION_CLIENT_ACTIVE_TIMEOUT;
+
+    loop {
+        let snapshot = client.snapshot().await;
+        match snapshot.phase {
+            FivemClientPhase::Active => return Ok(()),
+            FivemClientPhase::Crashed => {
+                return Err(session_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "SESSION_CLIENT_CRASHED",
+                    snapshot
+                        .last_error
+                        .unwrap_or_else(|| "FiveM/FxDK client crashed before ACTIVE".to_owned()),
+                ));
+            }
+            _ => {}
+        }
+
+        if Instant::now() >= deadline {
+            return Err(session_error(
+                StatusCode::GATEWAY_TIMEOUT,
+                "SESSION_ACTIVE_TIMEOUT",
+                format!(
+                    "FiveM/FxDK client did not reach ACTIVE within {} seconds",
+                    SESSION_CLIENT_ACTIVE_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+
+        sleep(SESSION_CLIENT_POLL_INTERVAL).await;
+    }
+}
+
+async fn rollback_session_runtime(state: &ControlApiState) {
+    let _ = state.client.stop().await;
+    let _ = state.fxserver.stop().await;
+}
+
+async fn set_session_state(
+    state: &ControlApiState,
+    id: Option<String>,
+    session_state: SessionState,
+    last_error: Option<String>,
+) {
+    let mut session = state.session.write().await;
+    session.id = id;
+    session.state = session_state;
+    session.last_error = last_error;
+}
+
+fn session_error(
+    status: StatusCode,
+    code: &str,
+    message: String,
+) -> HandlerError {
+    (
+        status,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: code.to_owned(),
+                message,
+                detail: None,
+            },
+        }),
+    )
+}
 
 #[utoipa::path(
     post,
@@ -758,7 +1104,7 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, start_server, stop_server, start_client, stop_client, client_event, get_config, patch_config, agent_guide),
+    paths(health, status, start_session, stop_session, start_server, stop_server, start_client, stop_client, client_event, get_config, patch_config, agent_guide),
     components(schemas(
         HealthResponse,
         ApiErrorResponse,
@@ -770,6 +1116,9 @@ async fn agent_guide() -> impl IntoResponse {
         SyntheticIdentityConfig,
         SyntheticIdentityPatch,
         LauncherState,
+        SessionState,
+        SessionStatus,
+        SessionStartRequest,
         ServerState,
         ClientState,
         AgentState,
@@ -813,8 +1162,8 @@ mod tests {
 
     use super::{
         AgentState, ApiErrorResponse, ControlApiState, ControlStatus, HealthResponse,
-        LauncherState, ServerState, default_control_addr, router, router_with_state,
-        server_start_options, serve,
+        LauncherState, ServerState, SessionState, default_control_addr, router,
+        router_with_state, server_start_options, serve,
     };
 
     fn test_config_store(name: &str) -> ConfigStore {
@@ -884,6 +1233,8 @@ mod tests {
 
         assert_eq!(payload.launcher.state, LauncherState::Ready);
         assert_eq!(payload.launcher.pid, Some(std::process::id()));
+        assert_eq!(payload.session.state, SessionState::Stopped);
+        assert_eq!(payload.session.id, None);
         assert_eq!(payload.server.state, ServerState::Stopped);
         assert_eq!(payload.server.address, None);
         assert_eq!(payload.server.pid, None);
@@ -943,6 +1294,8 @@ mod tests {
         assert_eq!(document["info"]["title"], "FXDK Agent Control API");
         assert!(document["paths"]["/v1/health"]["get"].is_object());
         assert!(document["paths"]["/v1/status"]["get"].is_object());
+        assert!(document["paths"]["/v1/session/start"]["post"].is_object());
+        assert!(document["paths"]["/v1/session/stop"]["post"].is_object());
         assert!(document["paths"]["/v1/config"]["get"].is_object());
         assert!(document["paths"]["/v1/config"]["patch"].is_object());
         assert!(document["paths"]["/v1/server/start"]["post"].is_object());
@@ -951,6 +1304,82 @@ mod tests {
         assert!(document["paths"]["/v1/client/stop"]["post"].is_object());
         assert!(document["paths"]["/v1/client/events"]["post"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn session_start_rejects_unsupported_client_count() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/session/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"clients":2}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("session start response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("session start error body");
+        let error: ApiErrorResponse =
+            serde_json::from_slice(&body).expect("session start error json");
+        assert_eq!(error.error.code, "SESSION_CLIENT_COUNT_UNSUPPORTED");
+    }
+
+    #[tokio::test]
+    async fn session_start_failure_is_reflected_in_status() {
+        let state = ControlApiState::in_memory(AppConfig::default());
+        let app = router_with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/session/start")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"clients":1}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("session start response");
+
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let status = super::control_status(&state).await;
+        assert_eq!(status.session.state, SessionState::Error);
+        assert!(status.session.id.is_some());
+        assert!(status.session.last_error.is_some());
+        assert_eq!(status.server.state, ServerState::Stopped);
+        assert!(status.clients.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_stop_is_idempotent_when_stopped() {
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/session/stop")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("session stop response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("session stop body");
+        let status: ControlStatus =
+            serde_json::from_slice(&body).expect("session stop json");
+
+        assert_eq!(status.session.state, SessionState::Stopped);
+        assert_eq!(status.session.id, None);
     }
 
     #[test]

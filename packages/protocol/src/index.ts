@@ -1,4 +1,5 @@
 export type LauncherState = 'starting' | 'ready' | 'stopping' | 'error';
+export type SessionState = 'stopped' | 'starting' | 'active' | 'stopping' | 'error';
 export type ServerState = 'stopped' | 'starting' | 'online' | 'stopping' | 'crashed';
 export type ClientState =
   | 'stopped'
@@ -15,6 +16,16 @@ export interface ProcessStatus {
 
 export interface LauncherStatus extends ProcessStatus {
   state: LauncherState;
+}
+
+export interface SessionStatus {
+  id: string | null;
+  state: SessionState;
+  lastError: string | null;
+}
+
+export interface SessionStartRequest {
+  clients: number;
 }
 
 export interface ServerStatus extends ProcessStatus {
@@ -42,6 +53,7 @@ export interface AgentStatus {
 
 export interface ControlStatus {
   launcher: LauncherStatus;
+  session: SessionStatus;
   server: ServerStatus;
   clients: ClientStatus[];
   agent: AgentStatus;

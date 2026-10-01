@@ -207,11 +207,18 @@ mod tests {
         body::{Body, to_bytes},
         http::{Request, StatusCode, header},
     };
+    use std::net::Ipv4Addr;
+
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        sync::oneshot,
+    };
     use tower::ServiceExt;
 
     use super::{
         AgentState, ControlStatus, HealthResponse, LauncherState, ServerState,
-        default_control_addr, router,
+        default_control_addr, router, serve,
     };
 
     #[test]
@@ -323,5 +330,43 @@ mod tests {
         assert!(document["paths"]["/v1/health"]["get"].is_object());
         assert!(document["paths"]["/v1/status"]["get"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn server_handles_real_http_and_graceful_shutdown() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind ephemeral listener");
+        let address = listener.local_addr().expect("listener address");
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            serve(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("control api server");
+        });
+
+        let mut stream = TcpStream::connect(address).await.expect("connect");
+        stream
+            .write_all(
+                b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write request");
+
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .await
+            .expect("read response");
+        let response = String::from_utf8(response).expect("http response utf8");
+
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"ok\":true"));
+
+        shutdown_tx.send(()).expect("signal shutdown");
+        server.await.expect("server task join");
     }
 }

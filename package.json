@@ -1,0 +1,17 @@
+{
+  "name": "fxdk-agent",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "bun@1.4.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "typecheck:protocol": "bunx tsc --noEmit -p packages/protocol/tsconfig.json",
+    "typecheck": "bun run typecheck:protocol"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  }
+}

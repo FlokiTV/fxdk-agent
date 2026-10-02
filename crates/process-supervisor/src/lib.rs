@@ -1,24 +1,21 @@
 use std::{
-    collections::VecDeque,
-    ffi::OsString,
-    io,
-    path::PathBuf,
-    process::Stdio,
-    sync::Arc,
+    collections::VecDeque, ffi::OsString, io, path::PathBuf, process::Stdio, sync::Arc,
     time::Duration,
 };
 
-use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 #[cfg(windows)]
 use process_wrap::tokio::JobObject;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader},
     sync::{Mutex, RwLock},
-    time::sleep,
+    time::{Instant, sleep},
 };
 
 const DEFAULT_LOG_TAIL_LINES: usize = 200;
 const MONITOR_INTERVAL: Duration = Duration::from_millis(250);
+const STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone)]
 pub struct ProcessSpec {
@@ -140,9 +137,9 @@ impl ProcessSupervisor {
         command.wrap(KillOnDrop);
 
         let mut child = command.spawn()?;
-        let pid = child.id().ok_or_else(|| {
-            io::Error::other("spawned process did not expose a process id")
-        })?;
+        let pid = child
+            .id()
+            .ok_or_else(|| io::Error::other("spawned process did not expose a process id"))?;
 
         if let Some(stdout) = child.stdout().take() {
             self.capture_output("stdout", stdout);
@@ -176,8 +173,24 @@ impl ProcessSupervisor {
 
         let mut child_slot = self.inner.child.lock().await;
         if let Some(child) = child_slot.as_mut() {
-            std::pin::Pin::from(child.kill()).await?;
-            let exit_code = child.try_wait()?.and_then(|status| status.code());
+            child.start_kill()?;
+
+            let deadline = Instant::now() + STOP_WAIT_TIMEOUT;
+            let exit_code = loop {
+                if let Some(status) = child.try_wait()? {
+                    break status.code();
+                }
+
+                if Instant::now() >= deadline {
+                    self.push_log(
+                        "[supervisor] stop wait timed out; dropping managed job handle".to_owned(),
+                    )
+                    .await;
+                    break None;
+                }
+
+                sleep(STOP_POLL_INTERVAL).await;
+            };
 
             let mut state = self.inner.state.write().await;
             state.phase = ProcessPhase::Stopped;
@@ -188,6 +201,9 @@ impl ProcessSupervisor {
             state.phase = ProcessPhase::Stopped;
             state.pid = None;
         }
+
+        // Dropping the JobObject child closes the managed job. With KillOnDrop enabled
+        // this is also the bounded fallback for descendants that do not report exit.
         *child_slot = None;
         drop(child_slot);
 
@@ -312,8 +328,7 @@ mod tests {
     #[tokio::test]
     async fn captures_output_and_observes_normal_exit() {
         let supervisor = ProcessSupervisor::new(20);
-        let spec = ProcessSpec::new("cmd.exe")
-            .args(["/C", "echo fxdk-agent-supervisor"]);
+        let spec = ProcessSpec::new("cmd.exe").args(["/C", "echo fxdk-agent-supervisor"]);
 
         let started = supervisor.spawn(spec).await.expect("spawn command");
         assert_eq!(started.phase, ProcessPhase::Running);
@@ -324,9 +339,12 @@ mod tests {
                 let snapshot = supervisor.snapshot().await;
                 if snapshot.phase == ProcessPhase::Exited {
                     assert_eq!(snapshot.exit_code, Some(0));
-                    assert!(snapshot.log_tail.iter().any(|line| {
-                        line.contains("fxdk-agent-supervisor")
-                    }));
+                    assert!(
+                        snapshot
+                            .log_tail
+                            .iter()
+                            .any(|line| { line.contains("fxdk-agent-supervisor") })
+                    );
                     break;
                 }
                 sleep(Duration::from_millis(50)).await;
@@ -340,10 +358,7 @@ mod tests {
     #[tokio::test]
     async fn stop_terminates_windows_job_descendants() {
         let supervisor = ProcessSupervisor::new(20);
-        let root = std::env::temp_dir().join(format!(
-            "fxdk-agent-job-test-{}",
-            process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("fxdk-agent-job-test-{}", process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("test root");
         let pid_file = root.join("child.pid");
@@ -376,9 +391,7 @@ mod tests {
 
         timeout(Duration::from_secs(5), async {
             loop {
-                if !windows_process_exists(parent_pid)
-                    && !windows_process_exists(child_pid)
-                {
+                if !windows_process_exists(parent_pid) && !windows_process_exists(child_pid) {
                     break;
                 }
                 sleep(Duration::from_millis(100)).await;

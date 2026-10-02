@@ -1,3 +1,11 @@
+mod agent_bridge;
+
+pub use agent_bridge::{
+    AgentBridge, AgentBridgeError, AgentCapabilitiesResponse, AgentInvokeRequest,
+    AgentInvokeResponse, AgentRuntimeError, AgentRuntimeRegistration, AgentRuntimeRequest,
+    AgentRuntimeResponse,
+};
+
 use std::{
     future::Future,
     io,
@@ -11,9 +19,9 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::{HeaderValue, Method, StatusCode, header},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::get,
 };
 use fxdk_agent_config::{
@@ -89,6 +97,7 @@ pub struct ControlApiState {
     identity_store: Option<DevIdentityStore>,
     fxserver: FxServerController,
     client: FivemClientController,
+    agent_bridge: AgentBridge,
     session: Arc<RwLock<SessionRuntimeState>>,
     session_operation: Arc<Mutex<()>>,
     session_counter: Arc<AtomicU64>,
@@ -102,6 +111,7 @@ impl ControlApiState {
             identity_store: None,
             fxserver: FxServerController::default(),
             client: FivemClientController::default(),
+            agent_bridge: AgentBridge::default(),
             session: Arc::new(RwLock::new(SessionRuntimeState::default())),
             session_operation: Arc::new(Mutex::new(())),
             session_counter: Arc::new(AtomicU64::new(0)),
@@ -117,6 +127,7 @@ impl ControlApiState {
             identity_store: None,
             fxserver: FxServerController::default(),
             client: FivemClientController::default(),
+            agent_bridge: AgentBridge::default(),
             session: Arc::new(RwLock::new(SessionRuntimeState::default())),
             session_operation: Arc::new(Mutex::new(())),
             session_counter: Arc::new(AtomicU64::new(0)),
@@ -298,6 +309,17 @@ pub fn router_with_state(state: ControlApiState) -> Router {
         .route("/v1/client/start", axum::routing::post(start_client))
         .route("/v1/client/stop", axum::routing::post(stop_client))
         .route("/v1/client/events", axum::routing::post(client_event))
+        .route("/v1/agent/capabilities", get(agent_capabilities))
+        .route("/v1/agent/invoke", axum::routing::post(agent_invoke))
+        .route(
+            "/v1/agent/runtime/register",
+            axum::routing::post(agent_runtime_register),
+        )
+        .route("/v1/agent/runtime/next", get(agent_runtime_next))
+        .route(
+            "/v1/agent/runtime/respond",
+            axum::routing::post(agent_runtime_respond),
+        )
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
         .route("/openapi.json", get(openapi))
@@ -364,6 +386,17 @@ async fn control_status(state: &ControlApiState) -> ControlStatus {
     let session = state.session.read().await.clone();
     let server = state.fxserver.snapshot().await;
     let client = state.client.snapshot().await;
+    let capabilities = state.agent_bridge.capabilities().await;
+    let agent_state = if capabilities.ready {
+        AgentState::Ready
+    } else if matches!(
+        client.phase,
+        FivemClientPhase::Starting | FivemClientPhase::Connecting | FivemClientPhase::Active
+    ) {
+        AgentState::Starting
+    } else {
+        AgentState::Disabled
+    };
     let clients = if client.phase == FivemClientPhase::Stopped {
         Vec::new()
     } else {
@@ -378,6 +411,10 @@ async fn control_status(state: &ControlApiState) -> ControlStatus {
         },
         server: server_status(server),
         clients,
+        agent: AgentStatus {
+            enabled: capabilities.ready,
+            state: agent_state,
+        },
         ..ControlStatus::initial()
     }
 }
@@ -451,6 +488,7 @@ async fn start_session(
 
     let _operation = state.session_operation.lock().await;
     ensure_session_startable(&state).await?;
+    state.agent_bridge.reset().await;
 
     let session_id = format!(
         "session-{:08}",
@@ -498,9 +536,11 @@ async fn stop_session(
     let _operation = state.session_operation.lock().await;
 
     if state.session.read().await.state == SessionState::Stopped {
+        state.agent_bridge.reset().await;
         return Ok(Json(control_status(&state).await));
     }
 
+    state.agent_bridge.reset().await;
     let session_id = state.session.read().await.id.clone();
     set_session_state(&state, session_id, SessionState::Stopping, None).await;
 
@@ -661,6 +701,7 @@ async fn wait_for_client_active(
 }
 
 async fn rollback_session_runtime(state: &ControlApiState) {
+    state.agent_bridge.reset().await;
     let _ = state.client.stop().await;
     let _ = state.fxserver.stop().await;
 }
@@ -835,6 +876,7 @@ async fn start_client(
     Json(request): Json<ClientRequest>,
 ) -> Result<Json<ControlStatus>, HandlerError> {
     validate_client_slot(&state, request.client)?;
+    state.agent_bridge.reset().await;
 
     let server = state.fxserver.snapshot().await;
     if server.phase != FxServerPhase::Online {
@@ -868,6 +910,7 @@ async fn stop_client(
     Json(request): Json<ClientRequest>,
 ) -> Result<Json<ControlStatus>, HandlerError> {
     validate_client_slot(&state, request.client)?;
+    state.agent_bridge.reset().await;
 
     state
         .client
@@ -985,11 +1028,18 @@ async fn client_event(
     State(state): State<ControlApiState>,
     Json(event): Json<FivemClientEvent>,
 ) -> Result<StatusCode, HandlerError> {
-    state
+    let snapshot = state
         .client
         .record_event(event)
         .await
         .map_err(client_event_error)?;
+
+    if matches!(
+        snapshot.phase,
+        FivemClientPhase::Stopped | FivemClientPhase::Crashed
+    ) {
+        state.agent_bridge.reset().await;
+    }
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1016,6 +1066,163 @@ fn client_event_error(error: FivemClientError) -> HandlerError {
             },
         }),
     )
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRuntimeQuery {
+    client_id: u32,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/agent/capabilities",
+    responses((status = 200, description = "Current in-game Agent API capabilities", body = AgentCapabilitiesResponse))
+)]
+async fn agent_capabilities(
+    State(state): State<ControlApiState>,
+) -> Json<AgentCapabilitiesResponse> {
+    Json(state.agent_bridge.capabilities().await)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/agent/invoke",
+    request_body = AgentInvokeRequest,
+    responses(
+        (status = 200, description = "Runtime request completed", body = AgentInvokeResponse),
+        (status = 409, description = "Runtime is unavailable or disconnected", body = ApiErrorResponse),
+        (status = 422, description = "Client or method is unsupported", body = ApiErrorResponse),
+        (status = 504, description = "Runtime request timed out", body = ApiErrorResponse)
+    )
+)]
+async fn agent_invoke(
+    State(state): State<ControlApiState>,
+    Json(request): Json<AgentInvokeRequest>,
+) -> Result<Json<AgentInvokeResponse>, HandlerError> {
+    validate_client_slot(&state, request.client_id)?;
+
+    if request.method.trim().is_empty() {
+        return Err(session_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "AGENT_METHOD_INVALID",
+            "agent method must not be empty".to_owned(),
+        ));
+    }
+
+    state
+        .agent_bridge
+        .invoke(request)
+        .await
+        .map(Json)
+        .map_err(agent_bridge_error)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/agent/runtime/register",
+    request_body = AgentRuntimeRegistration,
+    responses(
+        (status = 200, description = "Runtime registered and capabilities accepted", body = AgentCapabilitiesResponse),
+        (status = 422, description = "Client slot is unsupported", body = ApiErrorResponse)
+    )
+)]
+async fn agent_runtime_register(
+    State(state): State<ControlApiState>,
+    Json(registration): Json<AgentRuntimeRegistration>,
+) -> Result<Json<AgentCapabilitiesResponse>, HandlerError> {
+    validate_client_slot(&state, registration.client_id)?;
+    Ok(Json(state.agent_bridge.register(registration).await))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/agent/runtime/next",
+    params(("clientId" = u32, Query, description = "Managed runtime client slot")),
+    responses(
+        (status = 200, description = "Next pending runtime request", body = AgentRuntimeRequest),
+        (status = 204, description = "No request is pending"),
+        (status = 409, description = "Runtime is not registered", body = ApiErrorResponse),
+        (status = 422, description = "Client slot is unsupported", body = ApiErrorResponse)
+    )
+)]
+async fn agent_runtime_next(
+    State(state): State<ControlApiState>,
+    Query(query): Query<AgentRuntimeQuery>,
+) -> Result<Response, HandlerError> {
+    validate_client_slot(&state, query.client_id)?;
+
+    match state
+        .agent_bridge
+        .next_request(query.client_id)
+        .await
+        .map_err(agent_bridge_error)?
+    {
+        Some(request) => Ok(Json(request).into_response()),
+        None => Ok(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/agent/runtime/respond",
+    request_body = AgentRuntimeResponse,
+    responses(
+        (status = 204, description = "Runtime response accepted"),
+        (status = 404, description = "Request id is unknown or expired", body = ApiErrorResponse),
+        (status = 409, description = "Runtime is unavailable or disconnected", body = ApiErrorResponse),
+        (status = 422, description = "Client slot is unsupported", body = ApiErrorResponse)
+    )
+)]
+async fn agent_runtime_respond(
+    State(state): State<ControlApiState>,
+    Json(response): Json<AgentRuntimeResponse>,
+) -> Result<StatusCode, HandlerError> {
+    validate_client_slot(&state, response.client_id)?;
+    state
+        .agent_bridge
+        .respond(response)
+        .await
+        .map_err(agent_bridge_error)?;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn agent_bridge_error(error: AgentBridgeError) -> HandlerError {
+    let (status, code, message) = match error {
+        AgentBridgeError::RuntimeUnavailable => (
+            StatusCode::CONFLICT,
+            "AGENT_RUNTIME_UNAVAILABLE",
+            "in-game Agent API runtime is not registered",
+        ),
+        AgentBridgeError::WrongClient => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "AGENT_CLIENT_UNAVAILABLE",
+            "requested client does not own the registered Agent runtime",
+        ),
+        AgentBridgeError::MethodUnsupported => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "AGENT_METHOD_UNSUPPORTED",
+            "requested method is not advertised by the runtime",
+        ),
+        AgentBridgeError::Timeout => (
+            StatusCode::GATEWAY_TIMEOUT,
+            "AGENT_REQUEST_TIMEOUT",
+            "in-game Agent API request timed out",
+        ),
+        AgentBridgeError::ResponseChannelClosed => (
+            StatusCode::BAD_GATEWAY,
+            "AGENT_RUNTIME_DISCONNECTED",
+            "in-game Agent API runtime disconnected before responding",
+        ),
+        AgentBridgeError::UnknownRequest => (
+            StatusCode::NOT_FOUND,
+            "AGENT_REQUEST_UNKNOWN",
+            "agent request id is unknown or already expired",
+        ),
+    };
+
+    session_error(status, code, message.to_owned())
 }
 
 #[utoipa::path(
@@ -1104,7 +1311,7 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, start_session, stop_session, start_server, stop_server, start_client, stop_client, client_event, get_config, patch_config, agent_guide),
+    paths(health, status, start_session, stop_session, start_server, stop_server, start_client, stop_client, client_event, agent_capabilities, agent_invoke, agent_runtime_register, agent_runtime_next, agent_runtime_respond, get_config, patch_config, agent_guide),
     components(schemas(
         HealthResponse,
         ApiErrorResponse,
@@ -1128,6 +1335,13 @@ async fn agent_guide() -> impl IntoResponse {
         ClientRequest,
         AgentStatus,
         ControlStatus,
+        AgentInvokeRequest,
+        AgentInvokeResponse,
+        AgentRuntimeError,
+        AgentRuntimeRegistration,
+        AgentCapabilitiesResponse,
+        AgentRuntimeRequest,
+        AgentRuntimeResponse,
         FivemClientEvent
     )),
     info(
@@ -1161,9 +1375,9 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        AgentState, ApiErrorResponse, ControlApiState, ControlStatus, HealthResponse,
-        LauncherState, ServerState, SessionState, default_control_addr, router,
-        router_with_state, server_start_options, serve,
+        AgentInvokeResponse, AgentRuntimeRequest, AgentState, ApiErrorResponse, ControlApiState,
+        ControlStatus, HealthResponse, LauncherState, ServerState, SessionState,
+        default_control_addr, router, router_with_state, server_start_options, serve,
     };
 
     fn test_config_store(name: &str) -> ConfigStore {
@@ -1303,7 +1517,154 @@ mod tests {
         assert!(document["paths"]["/v1/client/start"]["post"].is_object());
         assert!(document["paths"]["/v1/client/stop"]["post"].is_object());
         assert!(document["paths"]["/v1/client/events"]["post"].is_object());
+        assert!(document["paths"]["/v1/agent/capabilities"]["get"].is_object());
+        assert!(document["paths"]["/v1/agent/invoke"]["post"].is_object());
+        assert!(document["paths"]["/v1/agent/runtime/register"]["post"].is_object());
+        assert!(document["paths"]["/v1/agent/runtime/next"]["get"].is_object());
+        assert!(document["paths"]["/v1/agent/runtime/respond"]["post"].is_object());
         assert!(document["paths"]["/agent.md"]["get"].is_object());
+    }
+
+    #[tokio::test]
+    async fn agent_transport_round_trip_works_through_http_routes() {
+        let state = ControlApiState::in_memory(AppConfig::default());
+        let app = router_with_state(state);
+
+        let register = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/runtime/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"clientId":1,"capabilities":["runtime.ping","runtime.status"]}"#,
+                    ))
+                    .expect("register request"),
+            )
+            .await
+            .expect("register response");
+        assert_eq!(register.status(), StatusCode::OK);
+
+        let invoke_app = app.clone();
+        let invoke = tokio::spawn(async move {
+            invoke_app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/v1/agent/invoke")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"clientId":1,"method":"runtime.ping","params":{"value":9},"timeoutMs":1000}"#,
+                        ))
+                        .expect("invoke request"),
+                )
+                .await
+                .expect("invoke response")
+        });
+
+        let runtime_request = loop {
+            let next = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/agent/runtime/next?clientId=1")
+                        .body(Body::empty())
+                        .expect("next request"),
+                )
+                .await
+                .expect("next response");
+
+            if next.status() == StatusCode::NO_CONTENT {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            assert_eq!(next.status(), StatusCode::OK);
+            let body = to_bytes(next.into_body(), usize::MAX)
+                .await
+                .expect("next body");
+            break serde_json::from_slice::<AgentRuntimeRequest>(&body)
+                .expect("runtime request json");
+        };
+
+        assert_eq!(runtime_request.method, "runtime.ping");
+        assert_eq!(runtime_request.params["value"], 9);
+
+        let response_body = serde_json::json!({
+            "requestId": runtime_request.request_id,
+            "clientId": 1,
+            "ok": true,
+            "result": {"pong": true}
+        })
+        .to_string();
+        let respond = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/runtime/respond")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_body))
+                    .expect("respond request"),
+            )
+            .await
+            .expect("respond response");
+        assert_eq!(respond.status(), StatusCode::NO_CONTENT);
+
+        let invoke = invoke.await.expect("invoke join");
+        assert_eq!(invoke.status(), StatusCode::OK);
+        let body = to_bytes(invoke.into_body(), usize::MAX)
+            .await
+            .expect("invoke body");
+        let response: AgentInvokeResponse =
+            serde_json::from_slice(&body).expect("invoke json");
+        assert!(response.ok);
+        assert_eq!(response.result.expect("result")["pong"], true);
+    }
+
+    #[tokio::test]
+    async fn agent_invoke_times_out_when_runtime_does_not_respond() {
+        let state = ControlApiState::in_memory(AppConfig::default());
+        let app = router_with_state(state);
+
+        let register = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/runtime/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"clientId":1,"capabilities":["runtime.ping"]}"#,
+                    ))
+                    .expect("register request"),
+            )
+            .await
+            .expect("register response");
+        assert_eq!(register.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/invoke")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"clientId":1,"method":"runtime.ping","timeoutMs":10}"#,
+                    ))
+                    .expect("invoke request"),
+            )
+            .await
+            .expect("invoke response");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("timeout body");
+        let error: ApiErrorResponse =
+            serde_json::from_slice(&body).expect("timeout error json");
+        assert_eq!(error.error.code, "AGENT_REQUEST_TIMEOUT");
     }
 
     #[tokio::test]

@@ -51,6 +51,52 @@ export interface AgentStatus {
   state: AgentState;
 }
 
+export interface AgentRuntimeError {
+  code: string;
+  message: string;
+  detail?: unknown;
+}
+
+export interface AgentInvokeRequest {
+  clientId?: number;
+  method: string;
+  params?: unknown;
+  timeoutMs?: number;
+}
+
+export interface AgentInvokeResponse {
+  requestId: string;
+  ok: boolean;
+  result?: unknown;
+  error?: AgentRuntimeError;
+}
+
+export interface AgentCapabilitiesResponse {
+  ready: boolean;
+  clientId: number | null;
+  capabilities: string[];
+}
+
+export interface AgentRuntimeRegistration {
+  clientId: number;
+  capabilities: string[];
+}
+
+export interface AgentRuntimeRequest {
+  requestId: string;
+  clientId: number;
+  method: string;
+  params: unknown;
+}
+
+export interface AgentRuntimeResponse {
+  requestId: string;
+  clientId: number;
+  ok: boolean;
+  result?: unknown;
+  error?: AgentRuntimeError;
+}
+
 export interface ControlStatus {
   launcher: LauncherStatus;
   session: SessionStatus;

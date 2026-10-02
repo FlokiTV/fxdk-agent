@@ -10,6 +10,58 @@ let gameLaunched = false;
 let connectionState = 0;
 let connectionRequested = false;
 let active = false;
+let agentRegistered = false;
+let agentPollInFlight = false;
+
+const AGENT_CAPABILITIES = [
+  'runtime.ping',
+  'runtime.status',
+];
+
+const requestJson = (method, path, payload, timeout = 2000) => new Promise((resolve, reject) => {
+  const body = payload === undefined ? null : JSON.stringify(payload);
+  const url = new URL(path, CONTROL_URL);
+  const headers = { accept: 'application/json' };
+  if (body !== null) {
+    headers['content-type'] = 'application/json';
+    headers['content-length'] = Buffer.byteLength(body);
+  }
+
+  const request = http.request(
+    {
+      hostname: url.hostname,
+      port: Number(url.port || 80),
+      path: `${url.pathname}${url.search}`,
+      method,
+      timeout,
+      headers,
+    },
+    (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+      response.on('end', () => {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        if (!raw) {
+          resolve({ statusCode: response.statusCode || 0, data: null });
+          return;
+        }
+
+        try {
+          resolve({
+            statusCode: response.statusCode || 0,
+            data: JSON.parse(raw),
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
+    },
+  );
+
+  request.on('timeout', () => request.destroy(new Error('request timeout')));
+  request.on('error', reject);
+  request.end(body || undefined);
+});
 
 const postEvent = (kind, data = {}) => {
   const body = JSON.stringify({
@@ -39,6 +91,101 @@ const postEvent = (kind, data = {}) => {
 
 const notifyBrowser = (payload) => {
   emit('sdk:api:send', JSON.stringify(payload));
+};
+
+const registerAgentRuntime = async () => {
+  try {
+    const response = await requestJson('POST', '/v1/agent/runtime/register', {
+      clientId: CLIENT_ID,
+      capabilities: AGENT_CAPABILITIES,
+    });
+    agentRegistered = response.statusCode === 200;
+  } catch {
+    agentRegistered = false;
+  }
+};
+
+const executeAgentRequest = async (request) => {
+  if (!request || typeof request.requestId !== 'string') {
+    return;
+  }
+
+  let response;
+  if (request.method === 'runtime.ping') {
+    response = {
+      requestId: request.requestId,
+      clientId: CLIENT_ID,
+      ok: true,
+      result: {
+        pong: true,
+        clientId: CLIENT_ID,
+        timestamp: new Date().toISOString(),
+      },
+    };
+  } else if (request.method === 'runtime.status') {
+    response = {
+      requestId: request.requestId,
+      clientId: CLIENT_ID,
+      ok: true,
+      result: {
+        clientId: CLIENT_ID,
+        serverAddress: SERVER_ADDRESS,
+        gameProcessState,
+        connectionState,
+        gameLaunched,
+        connectionRequested,
+        active,
+      },
+    };
+  } else {
+    response = {
+      requestId: request.requestId,
+      clientId: CLIENT_ID,
+      ok: false,
+      error: {
+        code: 'AGENT_METHOD_UNSUPPORTED',
+        message: `unsupported runtime method: ${String(request.method)}`,
+      },
+    };
+  }
+
+  try {
+    const result = await requestJson('POST', '/v1/agent/runtime/respond', response);
+    if (result.statusCode === 409) {
+      agentRegistered = false;
+    }
+  } catch {
+    agentRegistered = false;
+  }
+};
+
+const pollAgentRequest = async () => {
+  if (agentPollInFlight) return;
+  agentPollInFlight = true;
+
+  try {
+    if (!agentRegistered) {
+      await registerAgentRuntime();
+      if (!agentRegistered) return;
+    }
+
+    const response = await requestJson(
+      'GET',
+      `/v1/agent/runtime/next?clientId=${CLIENT_ID}`,
+      undefined,
+      1500,
+    );
+
+    if (response.statusCode === 200 && response.data) {
+      await executeAgentRequest(response.data);
+    } else if (response.statusCode === 409) {
+      agentRegistered = false;
+    }
+  } catch {
+    agentRegistered = false;
+  } finally {
+    agentPollInFlight = false;
+  }
 };
 
 const connect = (reason) => {
@@ -97,6 +244,7 @@ on('sdk:connectionStateChanged', (current, previous) => {
 });
 
 setTimeout(() => {
+  registerAgentRuntime();
   emit('sdk:openBrowser', UI_URL);
   notifyBrowser({ type: 'session-bootstrap', serverAddress: SERVER_ADDRESS });
   postEvent('sdk-ready', { serverAddress: SERVER_ADDRESS });
@@ -115,4 +263,7 @@ setInterval(() => {
     connectionState,
     active,
   });
+  registerAgentRuntime();
 }, 5000);
+
+setInterval(pollAgentRequest, 250);

@@ -133,6 +133,11 @@ mod tests {
             .expect("launcher js");
         assert!(launcher.contains("sdk:startGame"));
         assert!(launcher.contains("/v1/client/events"));
+        assert!(launcher.contains("/v1/agent/runtime/register"));
+        assert!(launcher.contains("/v1/agent/runtime/next"));
+        assert!(launcher.contains("/v1/agent/runtime/respond"));
+        assert!(launcher.contains("runtime.ping"));
+        assert!(launcher.contains("runtime.status"));
 
         let _ = fs::remove_dir_all(root);
     }

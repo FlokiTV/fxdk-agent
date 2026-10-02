@@ -89,6 +89,39 @@ Configured runtime paths and the server address are validated before persistence
 
 ## In-game Agent API
 
-The in-game Agent API is a separate optional capability. It is only usable after FXServer is running and the runtime reports the agent state as ready.
+The in-game Agent API is a separate runtime capability transported through the loopback Control API. It becomes usable after the FxDK runtime registers itself.
 
-Do not assume the in-game Agent API is available merely because the launcher Control API is healthy.
+Discover it first:
+
+```http
+GET /v1/agent/capabilities
+```
+
+A ready transport returns the managed client id plus the exact method names advertised by the runtime. Do not call methods that are absent from this list.
+
+Invoke a method through:
+
+```http
+POST /v1/agent/invoke
+Content-Type: application/json
+
+{
+  "clientId": 1,
+  "method": "runtime.status",
+  "params": {},
+  "timeoutMs": 5000
+}
+```
+
+The transport correlates every request with a unique request id and returns either `result` or a typed runtime `error`. Host-side transport failures use the normal Control API error envelope and stable codes such as `AGENT_RUNTIME_UNAVAILABLE`, `AGENT_METHOD_UNSUPPORTED`, and `AGENT_REQUEST_TIMEOUT`.
+
+The bootstrap capabilities are:
+
+- `runtime.ping` — verify request/response connectivity to the managed FxDK runtime.
+- `runtime.status` — inspect launcher-side GameRuntime/connection state.
+
+Endpoints under `/v1/agent/runtime/*` are reserved for the embedded FxDK runtime bridge. External agents should use `/v1/agent/capabilities` and `/v1/agent/invoke`.
+
+The bridge is reset when a managed client/session starts, stops, crashes, or rolls back, so stale request ids must not be reused across runtime lifecycles.
+
+Do not assume the in-game Agent API is available merely because the launcher Control API is healthy. Check `/v1/status` and `/v1/agent/capabilities`.

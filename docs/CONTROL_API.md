@@ -90,6 +90,27 @@ Stops all clients and server processes owned by the session.
 - `PATCH /v1/config` changes only explicitly supported fields.
 - Secret values are never returned in plain text.
 
+## In-game Agent transport
+
+External automation discovers runtime capabilities through:
+
+```http
+GET /v1/agent/capabilities
+```
+
+and invokes advertised runtime methods through:
+
+```http
+POST /v1/agent/invoke
+Content-Type: application/json
+
+{"clientId":1,"method":"runtime.ping","params":{},"timeoutMs":5000}
+```
+
+The host assigns a request id, queues the request for the embedded FxDK launcher, enforces a bounded timeout, and correlates the runtime response back to the caller. Runtime registration/poll/response endpoints live below `/v1/agent/runtime/*` and are internal bridge surfaces rather than the public automation entrypoint.
+
+The bridge is cleared on managed client/session lifecycle boundaries so pending requests cannot leak into a later runtime.
+
 ## Events
 
 Polling `/v1/status` is sufficient for the first implementation. Server-Sent Events at `GET /v1/events` are a possible later addition. WebSocket support is not a V1 requirement.

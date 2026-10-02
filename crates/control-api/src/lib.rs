@@ -19,11 +19,13 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    body::Body,
+    extract::{DefaultBodyLimit, Query, State},
     http::{HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use fxdk_agent_config::{
     AppConfig, ConfigPatch, ConfigStore, ConfigStoreError, ConfigValidationIssue,
     SyntheticIdentityConfig, SyntheticIdentityPatch, validate_runtime_paths,
@@ -38,7 +40,8 @@ use fxdk_agent_fxserver::{
     build_fxserver_spec_with_options,
 };
 use fxdk_agent_runtime_web::{
-    GAME_RESOURCE_NAME, cleanup_game_resource, materialize_sdk_root, stage_game_resource,
+    GAME_RESOURCE_NAME, SCREENSHOT_RESOURCE_NAME, cleanup_game_resource, materialize_sdk_root,
+    stage_game_resource,
 };
 use serde::{Deserialize, Serialize};
 use tokio::{
@@ -52,6 +55,12 @@ use utoipa::{OpenApi, ToSchema};
 pub const DEFAULT_CONTROL_PORT: u16 = 35_418;
 const SESSION_CLIENT_ACTIVE_TIMEOUT: Duration = Duration::from_secs(90);
 const SESSION_CLIENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const AGENT_RUNTIME_RESPONSE_BODY_LIMIT: usize = 36 * 1024 * 1024;
+const SCREENSHOT_REQUEST_TIMEOUT_MS: u64 = 12_000;
+const MAX_SCREENSHOT_DATA_URI_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SCREENSHOT_PNG_BYTES: usize = 24 * 1024 * 1024;
+const MAX_SCREENSHOT_WIDTH: u32 = 7_680;
+const MAX_SCREENSHOT_HEIGHT: u32 = 4_320;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -314,6 +323,7 @@ pub fn router_with_state(state: ControlApiState) -> Router {
         .route("/v1/client/events", axum::routing::post(client_event))
         .route("/v1/agent/capabilities", get(agent_capabilities))
         .route("/v1/agent/invoke", axum::routing::post(agent_invoke))
+        .route("/v1/agent/screenshot", get(agent_screenshot))
         .route(
             "/v1/agent/runtime/register",
             axum::routing::post(agent_runtime_register),
@@ -321,7 +331,8 @@ pub fn router_with_state(state: ControlApiState) -> Router {
         .route("/v1/agent/runtime/next", get(agent_runtime_next))
         .route(
             "/v1/agent/runtime/respond",
-            axum::routing::post(agent_runtime_respond),
+            axum::routing::post(agent_runtime_respond)
+                .layer(DefaultBodyLimit::max(AGENT_RUNTIME_RESPONSE_BODY_LIMIT)),
         )
         .route("/v1/config", get(get_config).patch(patch_config))
         .route("/agent.md", get(agent_guide))
@@ -820,7 +831,10 @@ fn stage_managed_game_resource(
         .ok_or_else(|| server_start_error(FxServerError::MissingServerProject))?;
 
     stage_game_resource(server_project).map_err(game_resource_prepare_error)?;
-    options.runtime_resource_name = Some(GAME_RESOURCE_NAME.to_owned());
+    options.runtime_resource_names = vec![
+        SCREENSHOT_RESOURCE_NAME.to_owned(),
+        GAME_RESOURCE_NAME.to_owned(),
+    ];
 
     Ok(())
 }
@@ -1127,6 +1141,22 @@ struct AgentRuntimeQuery {
     client_id: u32,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentScreenshotQuery {
+    client_id: u32,
+    quality: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentScreenshotResult {
+    data_uri: String,
+    mime_type: String,
+    encoding: String,
+    captured_at: String,
+}
+
 #[utoipa::path(
     get,
     path = "/v1/agent/capabilities",
@@ -1169,6 +1199,110 @@ async fn agent_invoke(
         .await
         .map(Json)
         .map_err(agent_bridge_error)
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/agent/screenshot",
+    params(
+        ("clientId" = u32, Query, description = "Managed runtime client slot"),
+        ("quality" = Option<f64>, Query, description = "PNG capture quality hint from 0.1 to 1.0")
+    ),
+    responses(
+        (status = 200, description = "Captured game render target", content_type = "image/png"),
+        (status = 409, description = "Runtime is unavailable or game bridge is not ready", body = ApiErrorResponse),
+        (status = 422, description = "Client slot or screenshot parameters are invalid", body = ApiErrorResponse),
+        (status = 502, description = "Runtime returned an invalid screenshot payload", body = ApiErrorResponse),
+        (status = 504, description = "Screenshot capture timed out", body = ApiErrorResponse)
+    )
+)]
+async fn agent_screenshot(
+    State(state): State<ControlApiState>,
+    Query(query): Query<AgentScreenshotQuery>,
+) -> Result<Response, HandlerError> {
+    validate_client_slot(&state, query.client_id)?;
+
+    let quality = query.quality.unwrap_or(0.92);
+    if !quality.is_finite() || !(0.1..=1.0).contains(&quality) {
+        return Err(session_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "AGENT_SCREENSHOT_QUALITY_INVALID",
+            "screenshot quality must be between 0.1 and 1.0".to_owned(),
+        ));
+    }
+
+    let runtime_response = state
+        .agent_bridge
+        .invoke(AgentInvokeRequest {
+            client_id: query.client_id,
+            method: "game.screenshot".to_owned(),
+            params: serde_json::json!({ "quality": quality }),
+            timeout_ms: Some(SCREENSHOT_REQUEST_TIMEOUT_MS),
+        })
+        .await
+        .map_err(agent_bridge_error)?;
+
+    if !runtime_response.ok {
+        return Err(agent_runtime_result_error(runtime_response.error));
+    }
+
+    let result = runtime_response.result.ok_or_else(|| {
+        session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_RESULT_MISSING",
+            "runtime returned no screenshot result".to_owned(),
+        )
+    })?;
+    let result: AgentScreenshotResult = serde_json::from_value(result).map_err(|error| {
+        session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_RESULT_INVALID",
+            format!("runtime returned an invalid screenshot envelope: {error}"),
+        )
+    })?;
+
+    if result.mime_type != "image/png" || result.encoding != "png" {
+        return Err(session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_FORMAT_INVALID",
+            format!(
+                "runtime returned unsupported screenshot format {}/{}",
+                result.mime_type, result.encoding
+            ),
+        ));
+    }
+
+    let (png, width, height) = decode_png_data_uri(&result.data_uri)?;
+
+    let mut response = Response::new(Body::from(png));
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "x-fxdk-agent-request-id",
+        screenshot_header_value(&runtime_response.request_id)?,
+    );
+    response.headers_mut().insert(
+        "x-fxdk-agent-client-id",
+        screenshot_header_value(&query.client_id.to_string())?,
+    );
+    response.headers_mut().insert(
+        "x-fxdk-agent-captured-at",
+        screenshot_header_value(&result.captured_at)?,
+    );
+    response.headers_mut().insert(
+        "x-fxdk-agent-width",
+        screenshot_header_value(&width.to_string())?,
+    );
+    response.headers_mut().insert(
+        "x-fxdk-agent-height",
+        screenshot_header_value(&height.to_string())?,
+    );
+
+    Ok(response)
 }
 
 #[utoipa::path(
@@ -1278,6 +1412,119 @@ fn agent_bridge_error(error: AgentBridgeError) -> HandlerError {
     session_error(status, code, message.to_owned())
 }
 
+fn agent_runtime_result_error(error: Option<AgentRuntimeError>) -> HandlerError {
+    let error = error.unwrap_or(AgentRuntimeError {
+        code: "AGENT_RUNTIME_RESULT_FAILED".to_owned(),
+        message: "runtime request failed without an error envelope".to_owned(),
+        detail: None,
+    });
+
+    let status = match error.code.as_str() {
+        "AGENT_SCREENSHOT_TIMEOUT" | "AGENT_GAME_REQUEST_TIMEOUT" => {
+            StatusCode::GATEWAY_TIMEOUT
+        }
+        "AGENT_SCREENSHOT_UNAVAILABLE"
+        | "AGENT_GAME_NOT_READY"
+        | "AGENT_GAME_BRIDGE_UNAVAILABLE"
+        | "AGENT_GAME_BRIDGE_RESET" => StatusCode::CONFLICT,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+
+    session_error(status, &error.code, error.message)
+}
+
+fn decode_png_data_uri(data_uri: &str) -> Result<(Vec<u8>, u32, u32), HandlerError> {
+    if data_uri.len() > MAX_SCREENSHOT_DATA_URI_BYTES {
+        return Err(session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_TOO_LARGE",
+            format!(
+                "runtime screenshot data URI exceeds {} bytes",
+                MAX_SCREENSHOT_DATA_URI_BYTES
+            ),
+        ));
+    }
+
+    let encoded = data_uri
+        .strip_prefix("data:image/png;base64,")
+        .ok_or_else(|| {
+            session_error(
+                StatusCode::BAD_GATEWAY,
+                "AGENT_SCREENSHOT_DATA_URI_INVALID",
+                "runtime screenshot is not a PNG data URI".to_owned(),
+            )
+        })?;
+
+    let png = STANDARD.decode(encoded).map_err(|error| {
+        session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_BASE64_INVALID",
+            format!("runtime screenshot base64 is invalid: {error}"),
+        )
+    })?;
+
+    if png.len() > MAX_SCREENSHOT_PNG_BYTES {
+        return Err(session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_TOO_LARGE",
+            format!(
+                "decoded screenshot exceeds {} bytes",
+                MAX_SCREENSHOT_PNG_BYTES
+            ),
+        ));
+    }
+
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if png.len() < 24
+        || &png[..8] != PNG_SIGNATURE
+        || &png[12..16] != b"IHDR"
+    {
+        return Err(session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_PNG_INVALID",
+            "runtime screenshot is not a valid PNG header".to_owned(),
+        ));
+    }
+
+    let width = u32::from_be_bytes(
+        png[16..20]
+            .try_into()
+            .expect("PNG width slice length is fixed"),
+    );
+    let height = u32::from_be_bytes(
+        png[20..24]
+            .try_into()
+            .expect("PNG height slice length is fixed"),
+    );
+
+    if width == 0
+        || height == 0
+        || width > MAX_SCREENSHOT_WIDTH
+        || height > MAX_SCREENSHOT_HEIGHT
+    {
+        return Err(session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_DIMENSIONS_INVALID",
+            format!(
+                "runtime screenshot dimensions {width}x{height} exceed supported bounds {}x{}",
+                MAX_SCREENSHOT_WIDTH, MAX_SCREENSHOT_HEIGHT
+            ),
+        ));
+    }
+
+    Ok((png, width, height))
+}
+
+fn screenshot_header_value(value: &str) -> Result<HeaderValue, HandlerError> {
+    HeaderValue::from_str(value).map_err(|error| {
+        session_error(
+            StatusCode::BAD_GATEWAY,
+            "AGENT_SCREENSHOT_METADATA_INVALID",
+            format!("runtime screenshot metadata is not a valid HTTP header value: {error}"),
+        )
+    })
+}
+
 #[utoipa::path(
     get,
     path = "/v1/config",
@@ -1374,6 +1621,7 @@ async fn agent_guide() -> impl IntoResponse {
         client_event,
         agent_capabilities,
         agent_invoke,
+        agent_screenshot,
         agent_runtime_register,
         agent_runtime_next,
         agent_runtime_respond,
@@ -1433,6 +1681,7 @@ mod tests {
     };
     use std::{fs, net::Ipv4Addr, process};
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use fxdk_agent_config::{AppConfig, ConfigStore, SyntheticIdentityConfig};
     use fxdk_agent_dev_identity::DevIdentityStore;
 
@@ -1465,6 +1714,19 @@ mod tests {
         ));
         let _ = fs::remove_dir_all(&root);
         DevIdentityStore::at(root.join("identity.json"))
+    }
+
+    fn test_png(width: u32, height: u32) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&13_u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&width.to_be_bytes());
+        png.extend_from_slice(&height.to_be_bytes());
+        png
+    }
+
+    fn test_png_data_uri(width: u32, height: u32) -> String {
+        format!("data:image/png;base64,{}", STANDARD.encode(test_png(width, height)))
     }
 
     #[test]
@@ -1591,6 +1853,7 @@ mod tests {
         assert!(document["paths"]["/v1/client/events"]["post"].is_object());
         assert!(document["paths"]["/v1/agent/capabilities"]["get"].is_object());
         assert!(document["paths"]["/v1/agent/invoke"]["post"].is_object());
+        assert!(document["paths"]["/v1/agent/screenshot"]["get"].is_object());
         assert!(document["paths"]["/v1/agent/runtime/register"]["post"].is_object());
         assert!(document["paths"]["/v1/agent/runtime/next"]["get"].is_object());
         assert!(document["paths"]["/v1/agent/runtime/respond"]["post"].is_object());
@@ -1692,6 +1955,158 @@ mod tests {
         let response: AgentInvokeResponse = serde_json::from_slice(&body).expect("invoke json");
         assert!(response.ok);
         assert_eq!(response.result.expect("result")["pong"], true);
+    }
+
+    #[test]
+    fn screenshot_decoder_accepts_bounded_png_and_rejects_oversized_dimensions() {
+        let data_uri = test_png_data_uri(1920, 1080);
+        let (png, width, height) =
+            super::decode_png_data_uri(&data_uri).expect("valid PNG data URI");
+
+        assert_eq!(png, test_png(1920, 1080));
+        assert_eq!(width, 1920);
+        assert_eq!(height, 1080);
+
+        let error = super::decode_png_data_uri(&test_png_data_uri(8000, 1080))
+            .expect_err("oversized dimensions must fail");
+        assert_eq!(error.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            error.1.0.error.code,
+            "AGENT_SCREENSHOT_DIMENSIONS_INVALID"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_screenshot_returns_png_bytes_and_metadata_headers() {
+        let state = ControlApiState::in_memory(AppConfig::default());
+        let app = router_with_state(state);
+
+        let register = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/runtime/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"clientId":1,"capabilities":["game.screenshot"]}"#,
+                    ))
+                    .expect("register request"),
+            )
+            .await
+            .expect("register response");
+        assert_eq!(register.status(), StatusCode::OK);
+
+        let screenshot_app = app.clone();
+        let screenshot = tokio::spawn(async move {
+            screenshot_app
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/agent/screenshot?clientId=1&quality=0.8")
+                        .body(Body::empty())
+                        .expect("screenshot request"),
+                )
+                .await
+                .expect("screenshot response")
+        });
+
+        let runtime_request = loop {
+            let next = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/v1/agent/runtime/next?clientId=1")
+                        .body(Body::empty())
+                        .expect("next request"),
+                )
+                .await
+                .expect("next response");
+
+            if next.status() == StatusCode::NO_CONTENT {
+                tokio::task::yield_now().await;
+                continue;
+            }
+
+            assert_eq!(next.status(), StatusCode::OK);
+            let body = to_bytes(next.into_body(), usize::MAX)
+                .await
+                .expect("next body");
+            break serde_json::from_slice::<AgentRuntimeRequest>(&body)
+                .expect("runtime request json");
+        };
+
+        assert_eq!(runtime_request.method, "game.screenshot");
+        assert_eq!(runtime_request.params["quality"], 0.8);
+
+        let request_id = runtime_request.request_id.clone();
+        let captured_at = "2026-10-02T17:00:00.000Z";
+        let png = test_png(1280, 720);
+        let response_body = serde_json::json!({
+            "requestId": runtime_request.request_id,
+            "clientId": 1,
+            "ok": true,
+            "result": {
+                "dataUri": format!("data:image/png;base64,{}", STANDARD.encode(&png)),
+                "mimeType": "image/png",
+                "encoding": "png",
+                "capturedAt": captured_at
+            }
+        })
+        .to_string();
+
+        let respond = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/agent/runtime/respond")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(response_body))
+                    .expect("respond request"),
+            )
+            .await
+            .expect("respond response");
+        assert_eq!(respond.status(), StatusCode::NO_CONTENT);
+
+        let screenshot = screenshot.await.expect("screenshot join");
+        assert_eq!(screenshot.status(), StatusCode::OK);
+        assert_eq!(
+            screenshot.headers().get(header::CONTENT_TYPE),
+            Some(&"image/png".parse().expect("content type"))
+        );
+        assert_eq!(
+            screenshot
+                .headers()
+                .get("x-fxdk-agent-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some(request_id.as_str())
+        );
+        assert_eq!(
+            screenshot
+                .headers()
+                .get("x-fxdk-agent-captured-at")
+                .and_then(|value| value.to_str().ok()),
+            Some(captured_at)
+        );
+        assert_eq!(
+            screenshot
+                .headers()
+                .get("x-fxdk-agent-width")
+                .and_then(|value| value.to_str().ok()),
+            Some("1280")
+        );
+        assert_eq!(
+            screenshot
+                .headers()
+                .get("x-fxdk-agent-height")
+                .and_then(|value| value.to_str().ok()),
+            Some("720")
+        );
+
+        let body = to_bytes(screenshot.into_body(), usize::MAX)
+            .await
+            .expect("screenshot body");
+        assert_eq!(body.as_ref(), png.as_slice());
     }
 
     #[tokio::test]

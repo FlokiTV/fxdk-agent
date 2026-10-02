@@ -1001,6 +1001,7 @@ name = "fxdk-agent-control-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "fxdk-agent-config",
  "fxdk-agent-dev-identity",
  "fxdk-agent-fivem-client",

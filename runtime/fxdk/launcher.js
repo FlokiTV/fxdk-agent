@@ -13,8 +13,10 @@ const SUPPORTED_GAME_CAPABILITIES = new Set([
   'game.player',
   'game.resources',
   'game.entities.nearby',
+  'game.screenshot',
 ]);
 const GAME_REQUEST_TIMEOUT_MS = 3500;
+const SCREENSHOT_REQUEST_TIMEOUT_MS = 10000;
 
 let gameProcessState = 0;
 let gameLaunched = false;
@@ -236,14 +238,17 @@ const executeGameRequest = (request) => {
   }
 
   return new Promise((resolve, reject) => {
+    const timeoutMs = request.method === 'game.screenshot'
+      ? SCREENSHOT_REQUEST_TIMEOUT_MS
+      : GAME_REQUEST_TIMEOUT_MS;
     const timer = setTimeout(() => {
       pendingGameRequests.delete(request.requestId);
       reject(agentFailure(
         'AGENT_GAME_REQUEST_TIMEOUT',
         'in-game Agent request timed out',
-        { requestId: request.requestId, method: request.method },
+        { requestId: request.requestId, method: request.method, timeoutMs },
       ));
-    }, GAME_REQUEST_TIMEOUT_MS);
+    }, timeoutMs);
 
     pendingGameRequests.set(request.requestId, { resolve, reject, timer });
 

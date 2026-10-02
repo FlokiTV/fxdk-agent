@@ -1,0 +1,3 @@
+source=https://github.com/citizenfx/screenshot-basic
+revision=a8558841aece3f8f44b416dac7b5e2be0c84336c
+files=dist/client.js,dist/ui.html,LICENSE

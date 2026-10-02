@@ -23,7 +23,7 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Default)]
 pub struct FxServerStartOptions {
     pub synthetic_identity: Option<SyntheticDevIdentity>,
-    pub runtime_resource_name: Option<String>,
+    pub runtime_resource_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -351,7 +351,7 @@ pub fn build_fxserver_spec_with_options(
 
     append_identity_convars(&mut args, options.synthetic_identity.as_ref());
 
-    if let Some(resource_name) = options.runtime_resource_name.as_deref() {
+    for resource_name in &options.runtime_resource_names {
         args.push(OsString::from("+ensure"));
         args.push(OsString::from(resource_name));
     }
@@ -503,7 +503,10 @@ mod tests {
         let spec = build_fxserver_spec_with_options(
             &config,
             &FxServerStartOptions {
-                runtime_resource_name: Some("fxdk-agent-game".to_owned()),
+                runtime_resource_names: vec![
+                    "fxdk-agent-screenshot".to_owned(),
+                    "fxdk-agent-game".to_owned(),
+                ],
                 ..FxServerStartOptions::default()
             },
         )
@@ -518,12 +521,17 @@ mod tests {
             .windows(2)
             .position(|window| window == ["+exec", "server.cfg"])
             .expect("server cfg");
-        let ensure_index = args
+        let screenshot_ensure_index = args
+            .windows(2)
+            .position(|window| window == ["+ensure", "fxdk-agent-screenshot"])
+            .expect("screenshot resource ensure");
+        let game_ensure_index = args
             .windows(2)
             .position(|window| window == ["+ensure", "fxdk-agent-game"])
-            .expect("runtime resource ensure");
+            .expect("game resource ensure");
 
-        assert!(ensure_index > exec_index);
+        assert!(screenshot_ensure_index > exec_index);
+        assert!(game_ensure_index > screenshot_ensure_index);
     }
 
     #[test]

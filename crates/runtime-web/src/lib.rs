@@ -17,6 +17,7 @@ use tokio::net::TcpListener;
 
 pub const DEFAULT_RUNTIME_WEB_PORT: u16 = 35_419;
 pub const GAME_RESOURCE_NAME: &str = "fxdk-agent-game";
+pub const SCREENSHOT_RESOURCE_NAME: &str = "fxdk-agent-screenshot";
 
 const INDEX_HTML: &str = include_str!("../../../runtime/fxdk/index.html");
 const GAME_VIEW_JS: &str = include_str!("../../../runtime/fxdk/game-view.js");
@@ -24,6 +25,16 @@ const FXMANIFEST_LUA: &str = include_str!("../../../runtime/fxdk/fxmanifest.lua"
 const LAUNCHER_JS: &str = include_str!("../../../runtime/fxdk/launcher.js");
 const GAME_FXMANIFEST_LUA: &str = include_str!("../../../runtime/fxdk-game/fxmanifest.lua");
 const GAME_CLIENT_JS: &str = include_str!("../../../runtime/fxdk-game/agent-client.js");
+const SCREENSHOT_FXMANIFEST_LUA: &str =
+    include_str!("../../../runtime/fxdk-screenshot/fxmanifest.lua");
+const GAME_SCREENSHOT_CLIENT_JS: &str =
+    include_str!("../../../runtime/fxdk-screenshot/vendor/screenshot-basic/dist/client.js");
+const GAME_SCREENSHOT_UI_HTML: &str =
+    include_str!("../../../runtime/fxdk-screenshot/vendor/screenshot-basic/dist/ui.html");
+const GAME_SCREENSHOT_LICENSE: &str =
+    include_str!("../../../runtime/fxdk-screenshot/vendor/screenshot-basic/LICENSE");
+const GAME_SCREENSHOT_UPSTREAM: &str =
+    include_str!("../../../runtime/fxdk-screenshot/vendor/screenshot-basic/UPSTREAM.txt");
 const GAME_RESOURCE_MARKER: &str = "FXDK Agent managed runtime resource v1\n";
 const GAME_RESOURCE_MARKER_FILE: &str = ".fxdk-agent-managed";
 
@@ -59,34 +70,80 @@ pub fn materialize_sdk_root_at(root: &Path) -> io::Result<()> {
 
 pub fn stage_game_resource(server_project: &Path) -> io::Result<PathBuf> {
     let category = server_project.join("resources").join("[fxdk-agent]");
-    let resource = category.join(GAME_RESOURCE_NAME);
+    let game_resource = category.join(GAME_RESOURCE_NAME);
+    let screenshot_resource = category.join(SCREENSHOT_RESOURCE_NAME);
 
-    if resource.exists() {
-        ensure_managed_resource(&resource)?;
-        fs::remove_dir_all(&resource)?;
+    for resource in [&game_resource, &screenshot_resource] {
+        if resource.exists() {
+            ensure_managed_resource(resource)?;
+        }
     }
 
-    fs::create_dir_all(&resource)?;
-    write_asset(&resource.join("fxmanifest.lua"), GAME_FXMANIFEST_LUA)?;
-    write_asset(&resource.join("agent-client.js"), GAME_CLIENT_JS)?;
+    for resource in [&game_resource, &screenshot_resource] {
+        if resource.exists() {
+            fs::remove_dir_all(resource)?;
+        }
+    }
+
+    fs::create_dir_all(&game_resource)?;
+    write_asset(
+        &game_resource.join("fxmanifest.lua"),
+        GAME_FXMANIFEST_LUA,
+    )?;
+    write_asset(
+        &game_resource.join("agent-client.js"),
+        GAME_CLIENT_JS,
+    )?;
     fs::write(
-        resource.join(GAME_RESOURCE_MARKER_FILE),
+        game_resource.join(GAME_RESOURCE_MARKER_FILE),
         GAME_RESOURCE_MARKER,
     )?;
 
-    Ok(resource)
+    fs::create_dir_all(&screenshot_resource)?;
+    write_asset(
+        &screenshot_resource.join("fxmanifest.lua"),
+        SCREENSHOT_FXMANIFEST_LUA,
+    )?;
+    let screenshot_root = screenshot_resource.join("vendor").join("screenshot-basic");
+    let screenshot_dist = screenshot_root.join("dist");
+    fs::create_dir_all(&screenshot_dist)?;
+    write_asset(
+        &screenshot_dist.join("client.js"),
+        GAME_SCREENSHOT_CLIENT_JS,
+    )?;
+    write_asset(
+        &screenshot_dist.join("ui.html"),
+        GAME_SCREENSHOT_UI_HTML,
+    )?;
+    write_asset(&screenshot_root.join("LICENSE"), GAME_SCREENSHOT_LICENSE)?;
+    write_asset(
+        &screenshot_root.join("UPSTREAM.txt"),
+        GAME_SCREENSHOT_UPSTREAM,
+    )?;
+    fs::write(
+        screenshot_resource.join(GAME_RESOURCE_MARKER_FILE),
+        GAME_RESOURCE_MARKER,
+    )?;
+
+    Ok(game_resource)
 }
 
 pub fn cleanup_game_resource(server_project: &Path) -> io::Result<()> {
     let category = server_project.join("resources").join("[fxdk-agent]");
-    let resource = category.join(GAME_RESOURCE_NAME);
+    let game_resource = category.join(GAME_RESOURCE_NAME);
+    let screenshot_resource = category.join(SCREENSHOT_RESOURCE_NAME);
 
-    if !resource.exists() {
-        return Ok(());
+    for resource in [&game_resource, &screenshot_resource] {
+        if resource.exists() {
+            ensure_managed_resource(resource)?;
+        }
     }
 
-    ensure_managed_resource(&resource)?;
-    fs::remove_dir_all(&resource)?;
+    for resource in [&game_resource, &screenshot_resource] {
+        if resource.exists() {
+            fs::remove_dir_all(resource)?;
+        }
+    }
 
     if category
         .read_dir()
@@ -180,8 +237,8 @@ mod tests {
     use tower::ServiceExt;
 
     use super::{
-        GAME_RESOURCE_NAME, cleanup_game_resource, default_runtime_web_addr,
-        materialize_sdk_root_at, router, stage_game_resource,
+        GAME_RESOURCE_NAME, SCREENSHOT_RESOURCE_NAME, cleanup_game_resource,
+        default_runtime_web_addr, materialize_sdk_root_at, router, stage_game_resource,
     };
 
     #[test]
@@ -232,12 +289,42 @@ mod tests {
             Some(GAME_RESOURCE_NAME)
         );
         assert!(resource.join("fxmanifest.lua").is_file());
+        let screenshot_resource = root
+            .join("resources")
+            .join("[fxdk-agent]")
+            .join(SCREENSHOT_RESOURCE_NAME);
+        assert!(screenshot_resource.join("fxmanifest.lua").is_file());
+        assert!(
+            screenshot_resource
+                .join("vendor")
+                .join("screenshot-basic")
+                .join("dist")
+                .join("client.js")
+                .is_file()
+        );
+        assert!(
+            screenshot_resource
+                .join("vendor")
+                .join("screenshot-basic")
+                .join("dist")
+                .join("ui.html")
+                .is_file()
+        );
+        assert!(
+            screenshot_resource
+                .join("vendor")
+                .join("screenshot-basic")
+                .join("LICENSE")
+                .is_file()
+        );
         let client = fs::read_to_string(resource.join("agent-client.js")).expect("agent client");
         assert!(client.contains("game.player"));
+        assert!(client.contains("game.screenshot"));
         assert!(client.contains("GetGamePool"));
 
-        cleanup_game_resource(&root).expect("cleanup game resource");
+        cleanup_game_resource(&root).expect("cleanup game resources");
         assert!(!resource.exists());
+        assert!(!screenshot_resource.exists());
 
         let _ = fs::remove_dir_all(root);
     }

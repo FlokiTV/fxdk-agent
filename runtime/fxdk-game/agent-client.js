@@ -1,11 +1,15 @@
 const SEND_SDK_MESSAGE_TO_BACKEND = '0xD651CF33';
 const RESOURCE_NAME = GetCurrentResourceName();
 
-const GAME_CAPABILITIES = [
+const BASE_GAME_CAPABILITIES = [
   'game.player',
   'game.resources',
   'game.entities.nearby',
 ];
+const SCREENSHOT_RESOURCE_NAME = 'fxdk-agent-screenshot';
+
+const SCREENSHOT_TIMEOUT_MS = 8000;
+const MAX_SCREENSHOT_DATA_URI_BYTES = 32 * 1024 * 1024;
 
 const sendSdkMessage = (type, data) => {
   Citizen.invokeNative(
@@ -212,7 +216,97 @@ const nearbyEntitiesSnapshot = (params = {}) => {
   };
 };
 
-const executeRequest = (request) => {
+const screenshotSnapshot = (params = {}) => new Promise((resolve, reject) => {
+  const quality = numberInRange(params.quality, 0.92, 0.1, 1);
+  let settled = false;
+
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    reject(agentFailure(
+      'AGENT_SCREENSHOT_TIMEOUT',
+      'game screenshot capture timed out',
+      { timeoutMs: SCREENSHOT_TIMEOUT_MS },
+    ));
+  }, SCREENSHOT_TIMEOUT_MS);
+
+  const finish = (callback) => {
+    if (settled) return;
+    settled = true;
+    clearTimeout(timer);
+    callback();
+  };
+
+  try {
+    if (GetResourceState(SCREENSHOT_RESOURCE_NAME) !== 'started') {
+      finish(() => reject(agentFailure(
+        'AGENT_SCREENSHOT_UNAVAILABLE',
+        'screenshot resource is not started',
+        { resource: SCREENSHOT_RESOURCE_NAME },
+      )));
+      return;
+    }
+
+    const resourceExports = global.exports?.[SCREENSHOT_RESOURCE_NAME];
+    const capture = resourceExports?.requestScreenshot;
+
+    if (typeof capture !== 'function') {
+      finish(() => reject(agentFailure(
+        'AGENT_SCREENSHOT_UNAVAILABLE',
+        'screenshot capture export is unavailable',
+        { resource: RESOURCE_NAME },
+      )));
+      return;
+    }
+
+    capture(
+      {
+        encoding: 'png',
+        quality,
+      },
+      (dataUri) => {
+        finish(() => {
+          if (
+            typeof dataUri !== 'string'
+            || !dataUri.startsWith('data:image/png;base64,')
+          ) {
+            reject(agentFailure(
+              'AGENT_SCREENSHOT_INVALID',
+              'screenshot capture returned an invalid PNG data URI',
+            ));
+            return;
+          }
+
+          if (dataUri.length > MAX_SCREENSHOT_DATA_URI_BYTES) {
+            reject(agentFailure(
+              'AGENT_SCREENSHOT_TOO_LARGE',
+              'screenshot exceeds the bounded payload size',
+              {
+                bytes: dataUri.length,
+                maxBytes: MAX_SCREENSHOT_DATA_URI_BYTES,
+              },
+            ));
+            return;
+          }
+
+          resolve({
+            dataUri,
+            mimeType: 'image/png',
+            encoding: 'png',
+            capturedAt: new Date().toISOString(),
+          });
+        });
+      },
+    );
+  } catch (error) {
+    finish(() => reject(agentFailure(
+      'AGENT_SCREENSHOT_FAILED',
+      error instanceof Error ? error.message : String(error),
+    )));
+  }
+});
+
+const executeRequest = async (request) => {
   switch (request.method) {
     case 'game.player':
       return playerSnapshot();
@@ -220,6 +314,8 @@ const executeRequest = (request) => {
       return resourcesSnapshot(request.params || {});
     case 'game.entities.nearby':
       return nearbyEntitiesSnapshot(request.params || {});
+    case 'game.screenshot':
+      return screenshotSnapshot(request.params || {});
     default:
       throw agentFailure(
         'AGENT_METHOD_UNSUPPORTED',
@@ -229,7 +325,7 @@ const executeRequest = (request) => {
   }
 };
 
-on('fxdk-agent:request', (rawRequest) => {
+on('fxdk-agent:request', async (rawRequest) => {
   let request;
 
   try {
@@ -241,7 +337,7 @@ on('fxdk-agent:request', (rawRequest) => {
       return;
     }
 
-    const result = executeRequest(request);
+    const result = await executeRequest(request);
     sendSdkMessage('fxdk-agent:response', {
       requestId: request.requestId,
       ok: true,
@@ -264,10 +360,20 @@ on('fxdk-agent:request', (rawRequest) => {
   }
 });
 
+const currentCapabilities = () => {
+  const capabilities = [...BASE_GAME_CAPABILITIES];
+
+  if (GetResourceState(SCREENSHOT_RESOURCE_NAME) === 'started') {
+    capabilities.push('game.screenshot');
+  }
+
+  return capabilities;
+};
+
 const announceReady = () => {
   sendSdkMessage('fxdk-agent:ready', {
     resource: RESOURCE_NAME,
-    capabilities: GAME_CAPABILITIES,
+    capabilities: currentCapabilities(),
   });
 };
 

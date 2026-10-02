@@ -58,22 +58,81 @@ Optional in-game Agent API
 
 ## Project status
 
-The repository is currently **WIP** and the MVP implementation is underway.
+The repository is currently **WIP**, but the first Windows MVP is functional end to end.
 
-Foundation already in place:
+Implemented and validated on Windows:
 
-- Cargo workspace with a native Rust host crate;
-- Tauri 2 desktop shell with Svelte 5 + TypeScript bundled by Rspack 2;
-- shared TypeScript protocol package;
+- native Rust host embedded directly in the Tauri desktop executable;
+- Svelte 5 + TypeScript UI bundled by Rspack 2;
 - loopback Control API on `127.0.0.1:35418`;
-- runtime discovery through `/agent.md` and `/openapi.json`;
-- versioned local configuration with `GET/PATCH /v1/config`;
-- runtime path validation before config persistence;
-- Svelte environment configuration view;
-- root-level typecheck/check/build commands;
-- local host + frontend smoke validated on Windows.
+- FxDK Runtime Web endpoint on `127.0.0.1:35419`;
+- machine-readable discovery through `/openapi.json` and `/agent.md`;
+- versioned local configuration with path and loopback validation;
+- Windows process-tree ownership and deterministic cleanup;
+- managed FXServer lifecycle with readiness/crash state;
+- managed FiveM/FxDK lifecycle with GameRuntime telemetry;
+- high-level `session/start` and `session/stop` orchestration;
+- deterministic development identities transported to the managed FXServer;
+- session dashboard with environment configuration and Start/Stop controls;
+- real repeated start -> ACTIVE -> stop smoke tests against a TypeScript FiveM server project;
+- Windows release executable that runs without Python, Node.js, Bun, or Rust installed on the target machine.
 
-The next milestone is process supervision and FXServer lifecycle: owned process trees, readiness detection, crash state, deterministic stop, and orphan cleanup.
+The in-game Agent API, advanced multi-client support, input automation, and native Cfx identifier injection remain outside this MVP.
+
+## Quickstart (WIP)
+
+The current MVP is a portable Windows desktop executable. It embeds the Rust control plane, so there is no separate host process to start.
+
+1. Run `fxdk-agent-desktop.exe`.
+2. Configure the server project directory, FXServer executable, FiveM executable, loopback server address, and optional synthetic DEV identity.
+3. Save the configuration.
+4. Click **Start session**.
+
+A successful managed start performs:
+
+```text
+desktop boot
+-> Control API ready
+-> Runtime Web ready
+-> FXServer online
+-> FiveM/FxDK launched
+-> GameRuntime running
+-> local client connection ACTIVE
+```
+
+Click **Stop** to tear down the managed FiveM/FxDK process tree and then FXServer.
+
+The Control API remains available while the desktop is running at `http://127.0.0.1:35418`.
+
+For agents and automation, start with:
+
+```http
+GET /agent.md
+GET /v1/status
+```
+
+The high-level lifecycle endpoints are:
+
+```http
+POST /v1/session/start
+Content-Type: application/json
+
+{"clients":1}
+```
+
+and:
+
+```http
+POST /v1/session/stop
+```
+
+`session/start` returns only after the MVP client reaches ACTIVE, or returns an error after crash/timeout and rolls back managed processes.
+
+### Synthetic DEV identity caveat
+
+The MVP generates a deterministic 40-hex development identity per client slot and exposes it to the managed FXServer through FXDK Agent development convars.
+
+Current FxDK connections still do not populate native `license:` / `license2:` values in `GetPlayerIdentifiers()`. See [`docs/SYNTHETIC_IDENTITY.md`](docs/SYNTHETIC_IDENTITY.md) for the validated Lua/JavaScript behavior and current limitation.
 
 ## Development
 
@@ -102,6 +161,20 @@ Build the TypeScript frontend and Rust workspace:
 bun run build
 ```
 
+Build the portable Windows release executable:
+
+```bash
+bun run build:windows
+```
+
+The WIP release executable is produced at:
+
+```text
+target/release/fxdk-agent-desktop.exe
+```
+
+This command requires Rust/Cargo in `PATH` on the build machine. The generated executable does not require Bun, Node.js, Python, or Rust at runtime.
+
 Run the desktop shell in development mode:
 
 ```bash
@@ -117,6 +190,7 @@ The public configuration contract contains:
 - server project directory;
 - FXServer executable path;
 - FiveM executable path;
+- loopback server address;
 - synthetic development identity toggle.
 
 The same contract is available through:

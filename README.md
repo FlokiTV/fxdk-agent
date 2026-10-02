@@ -164,16 +164,21 @@ bun run build
 Build the portable Windows release executable:
 
 ```bash
-bun run build:windows
+bun run release:standalone
 ```
 
-The WIP release executable is produced at:
+This performs the Tauri `--no-bundle` release build, validates Windows version metadata and direct PE imports, writes a SHA-256 checksum, boots the executable, probes both loopback HTTP services, verifies that no Node/Bun/Python runtime process is spawned, and confirms that the ports are released on shutdown.
+
+Artifacts are produced at:
 
 ```text
 target/release/fxdk-agent-desktop.exe
+target/release/fxdk-agent-desktop.exe.sha256
 ```
 
-This command requires Rust/Cargo in `PATH` on the build machine. The generated executable does not require Bun, Node.js, Python, or Rust at runtime.
+`bun run build:windows` remains available when only the raw Tauri release build is desired. The standalone release command resolves Cargo from `%USERPROFILE%\\.cargo\\bin` when necessary.
+
+Bun, Node.js, Python, Cargo, and Rust are build-time tools only and are not required by the generated executable. The desktop UI uses the Microsoft Edge WebView2 Runtime supplied/serviced by Windows; WebView2 child processes are therefore expected while the app is open.
 
 Run the desktop shell in development mode:
 

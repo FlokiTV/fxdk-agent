@@ -9,9 +9,7 @@ use std::{
 
 use fxdk_agent_config::AppConfig;
 use fxdk_agent_dev_identity::SyntheticDevIdentity;
-use fxdk_agent_process_supervisor::{
-    ProcessPhase, ProcessSpec, ProcessSupervisor,
-};
+use fxdk_agent_process_supervisor::{ProcessPhase, ProcessSpec, ProcessSupervisor};
 use tokio::{
     net::TcpStream,
     sync::{Mutex, RwLock},
@@ -25,6 +23,7 @@ const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
 #[derive(Debug, Clone, Default)]
 pub struct FxServerStartOptions {
     pub synthetic_identity: Option<SyntheticDevIdentity>,
+    pub runtime_resource_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,10 +89,18 @@ impl fmt::Display for FxServerError {
                 write!(formatter, "server.cfg was not found at {}", path.display())
             }
             Self::InvalidServerProject(path) => {
-                write!(formatter, "server project is not a directory: {}", path.display())
+                write!(
+                    formatter,
+                    "server project is not a directory: {}",
+                    path.display()
+                )
             }
             Self::InvalidFxServerPath(path) => {
-                write!(formatter, "FXServer executable is not a file: {}", path.display())
+                write!(
+                    formatter,
+                    "FXServer executable is not a file: {}",
+                    path.display()
+                )
             }
             Self::AlreadyRunning => write!(formatter, "FXServer is already running"),
             Self::Spawn(error) => write!(formatter, "failed to spawn FXServer: {error}"),
@@ -136,10 +143,7 @@ impl FxServerController {
         }
     }
 
-    pub async fn start(
-        &self,
-        config: &AppConfig,
-    ) -> Result<FxServerSnapshot, FxServerError> {
+    pub async fn start(&self, config: &AppConfig) -> Result<FxServerSnapshot, FxServerError> {
         self.start_with_options(config, FxServerStartOptions::default())
             .await
     }
@@ -218,11 +222,7 @@ impl FxServerController {
             state.phase = FxServerPhase::Stopping;
         }
 
-        let process = self
-            .supervisor
-            .stop()
-            .await
-            .map_err(FxServerError::Stop)?;
+        let process = self.supervisor.stop().await.map_err(FxServerError::Stop)?;
 
         {
             let mut state = self.state.write().await;
@@ -332,22 +332,36 @@ pub fn build_fxserver_spec_with_options(
     append_identity_convars(&mut args, options.synthetic_identity.as_ref());
 
     args.extend(
-        ["+exec", "server.cfg", "+set", "sv_lan", "1", "+set", "onesync", "on", "+set", "sv_fxdkMode", "1"]
-            .into_iter()
-            .map(OsString::from),
+        [
+            "+exec",
+            "server.cfg",
+            "+set",
+            "sv_lan",
+            "1",
+            "+set",
+            "onesync",
+            "on",
+            "+set",
+            "sv_fxdkMode",
+            "1",
+        ]
+        .into_iter()
+        .map(OsString::from),
     );
 
     append_identity_convars(&mut args, options.synthetic_identity.as_ref());
+
+    if let Some(resource_name) = options.runtime_resource_name.as_deref() {
+        args.push(OsString::from("+ensure"));
+        args.push(OsString::from(resource_name));
+    }
 
     Ok(ProcessSpec::new(fxserver_path)
         .args(args)
         .current_dir(server_project))
 }
 
-fn append_identity_convars(
-    args: &mut Vec<OsString>,
-    identity: Option<&SyntheticDevIdentity>,
-) {
+fn append_identity_convars(args: &mut Vec<OsString>, identity: Option<&SyntheticDevIdentity>) {
     let Some(identity) = identity else {
         return;
     };
@@ -394,23 +408,20 @@ mod tests {
     use fxdk_agent_dev_identity::SyntheticDevIdentity;
 
     use super::{
-        FxServerError, FxServerStartOptions, build_fxserver_spec,
-        build_fxserver_spec_with_options,
+        FxServerError, FxServerStartOptions, build_fxserver_spec, build_fxserver_spec_with_options,
     };
 
     #[test]
     fn launch_spec_requires_configured_paths() {
-        let error = build_fxserver_spec(&AppConfig::default())
-            .expect_err("missing project must fail");
+        let error =
+            build_fxserver_spec(&AppConfig::default()).expect_err("missing project must fail");
         assert!(matches!(error, FxServerError::MissingServerProject));
     }
 
     #[tokio::test]
     async fn early_process_exit_becomes_crashed_state() {
-        let root = std::env::temp_dir().join(format!(
-            "fxdk-agent-fxserver-crash-{}",
-            process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fxdk-agent-fxserver-crash-{}", process::id()));
         let _ = fs::remove_dir_all(&root);
         let project = root.join("server-data");
         fs::create_dir_all(&project).expect("project");
@@ -424,7 +435,10 @@ mod tests {
         };
         let controller = super::FxServerController::new(Duration::from_secs(3));
 
-        let error = controller.start(&config).await.expect_err("start must fail");
+        let error = controller
+            .start(&config)
+            .await
+            .expect_err("start must fail");
         assert!(matches!(error, FxServerError::EarlyExit(_)));
 
         let snapshot = controller.snapshot().await;
@@ -434,10 +448,7 @@ mod tests {
 
     #[test]
     fn launch_spec_uses_server_project_and_dev_convars() {
-        let root = std::env::temp_dir().join(format!(
-            "fxdk-agent-fxserver-spec-{}",
-            process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("fxdk-agent-fxserver-spec-{}", process::id()));
         let _ = fs::remove_dir_all(&root);
         let project = root.join("server-data");
         fs::create_dir_all(&project).expect("project");
@@ -460,13 +471,59 @@ mod tests {
             .iter()
             .map(|arg| arg.to_string_lossy())
             .collect::<Vec<_>>();
-        assert!(args.windows(3).any(|window| {
-            window == ["+set", "sv_lan", "1"]
-        }));
-        assert!(args.windows(2).any(|window| {
-            window == ["+exec", "server.cfg"]
-        }));
+        assert!(
+            args.windows(3)
+                .any(|window| { window == ["+set", "sv_lan", "1"] })
+        );
+        assert!(
+            args.windows(2)
+                .any(|window| { window == ["+exec", "server.cfg"] })
+        );
         assert!(!args.iter().any(|arg| arg == "fxdk_agent_dev_license"));
+    }
+
+    #[test]
+    fn launch_spec_ensures_runtime_resource_after_server_cfg() {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-fxserver-runtime-resource-spec-{}",
+            process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let project = root.join("server-data");
+        fs::create_dir_all(&project).expect("project");
+        fs::write(project.join("server.cfg"), b"# test").expect("server cfg");
+        let executable = root.join("FXServer.exe");
+        fs::write(&executable, b"test").expect("fake executable");
+
+        let config = AppConfig {
+            server_project: Some(project),
+            fxserver_path: Some(executable),
+            ..AppConfig::default()
+        };
+        let spec = build_fxserver_spec_with_options(
+            &config,
+            &FxServerStartOptions {
+                runtime_resource_name: Some("fxdk-agent-game".to_owned()),
+                ..FxServerStartOptions::default()
+            },
+        )
+        .expect("build runtime resource spec");
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let exec_index = args
+            .windows(2)
+            .position(|window| window == ["+exec", "server.cfg"])
+            .expect("server cfg");
+        let ensure_index = args
+            .windows(2)
+            .position(|window| window == ["+ensure", "fxdk-agent-game"])
+            .expect("runtime resource ensure");
+
+        assert!(ensure_index > exec_index);
     }
 
     #[test]
@@ -485,9 +542,7 @@ mod tests {
         let config = AppConfig {
             server_project: Some(project),
             fxserver_path: Some(executable),
-            synthetic_identity: fxdk_agent_config::SyntheticIdentityConfig {
-                enabled: true,
-            },
+            synthetic_identity: fxdk_agent_config::SyntheticIdentityConfig { enabled: true },
             ..AppConfig::default()
         };
         let identity = SyntheticDevIdentity {
@@ -499,6 +554,7 @@ mod tests {
             &config,
             &FxServerStartOptions {
                 synthetic_identity: Some(identity.clone()),
+                ..FxServerStartOptions::default()
             },
         )
         .expect("build identity spec");

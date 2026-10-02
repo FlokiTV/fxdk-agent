@@ -115,10 +115,15 @@ Content-Type: application/json
 
 The transport correlates every request with a unique request id and returns either `result` or a typed runtime `error`. Host-side transport failures use the normal Control API error envelope and stable codes such as `AGENT_RUNTIME_UNAVAILABLE`, `AGENT_METHOD_UNSUPPORTED`, and `AGENT_REQUEST_TIMEOUT`.
 
-The bootstrap capabilities are:
+The runtime advertises the exact available method names. The core observation methods are:
 
 - `runtime.ping` — verify request/response connectivity to the managed FxDK runtime.
 - `runtime.status` — inspect launcher-side GameRuntime/connection state.
+- `game.player` — bounded local-player snapshot including ped, coordinates, heading, health, armor, model, and current vehicle.
+- `game.resources` — bounded resource name/state snapshot. `params.limit` is clamped to 1..512.
+- `game.entities.nearby` — bounded nearby ped/vehicle/object snapshot. `params.radius` is clamped to 1..500 meters and `params.limit` to 1..256.
+
+Gameplay observation calls require the managed client to be ACTIVE. Results include a runtime context with client id, server address, connection/game process state, and timestamp. The API intentionally does not expose arbitrary convar/environment dumps or secrets.
 
 Endpoints under `/v1/agent/runtime/*` are reserved for the embedded FxDK runtime bridge. External agents should use `/v1/agent/capabilities` and `/v1/agent/invoke`.
 

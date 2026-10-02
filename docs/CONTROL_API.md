@@ -111,6 +111,30 @@ The host assigns a request id, queues the request for the embedded FxDK launcher
 
 The bridge is cleared on managed client/session lifecycle boundaries so pending requests cannot leak into a later runtime.
 
+### Game observation methods
+
+The managed FxDK client currently advertises bounded observation methods:
+
+- `game.player` returns local player/ped state, coordinates, heading, health/armor/model, and current vehicle state when present.
+- `game.resources` returns resource names and states, with `limit` clamped to `1..512`.
+- `game.entities.nearby` returns nearby peds, vehicles, and objects. Radius is clamped to `1..500` meters and result count to `1..256`.
+
+Example:
+
+```json
+{
+  "clientId": 1,
+  "method": "game.entities.nearby",
+  "params": {
+    "radius": 75,
+    "limit": 32,
+    "types": ["ped", "vehicle"]
+  }
+}
+```
+
+These methods require an ACTIVE managed game client and a ready in-game bridge. The host stages a marker-protected `resources/[fxdk-agent]/fxdk-agent-game` resource before FXServer start, ensures it after `server.cfg`, and removes only that managed resource during stop/rollback. Observation payloads are explicitly bounded and do not expose arbitrary environment/convar dumps.
+
 ## Events
 
 Polling `/v1/status` is sufficient for the first implementation. Server-Sent Events at `GET /v1/events` are a possible later addition. WebSocket support is not a V1 requirement.

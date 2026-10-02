@@ -97,6 +97,94 @@ export interface AgentRuntimeResponse {
   error?: AgentRuntimeError;
 }
 
+export interface AgentVector3 {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface AgentRuntimeContext {
+  clientId: number;
+  serverAddress: string;
+  gameProcessState: number;
+  connectionState: number;
+  active: boolean;
+  timestamp: string;
+}
+
+export interface AgentVehicleSnapshot {
+  entity: number;
+  type: 'vehicle';
+  model: number;
+  coords: AgentVector3;
+  heading: number;
+  isDriver: boolean;
+}
+
+export interface AgentPlayerSnapshot {
+  context: AgentRuntimeContext;
+  player: {
+    playerId: number;
+    serverId: number;
+    ped: number;
+    coords: AgentVector3;
+    heading: number;
+    health: number;
+    maxHealth: number;
+    armor: number;
+    dead: boolean;
+    model: number;
+    vehicle: AgentVehicleSnapshot | null;
+  };
+}
+
+export interface AgentResourcesParams {
+  limit?: number;
+}
+
+export interface AgentResourceSnapshot {
+  name: string;
+  state: string;
+}
+
+export interface AgentResourcesSnapshot {
+  context: AgentRuntimeContext;
+  total: number;
+  returned: number;
+  truncated: boolean;
+  resources: AgentResourceSnapshot[];
+}
+
+export type AgentEntityType = 'ped' | 'vehicle' | 'object';
+
+export interface AgentNearbyEntitiesParams {
+  radius?: number;
+  limit?: number;
+  types?: AgentEntityType[];
+}
+
+export interface AgentEntitySnapshot {
+  entity: number;
+  type: AgentEntityType;
+  model: number;
+  coords: AgentVector3;
+  heading: number;
+  distance: number;
+  isPlayer?: boolean;
+}
+
+export interface AgentNearbyEntitiesSnapshot {
+  context: AgentRuntimeContext;
+  origin: AgentVector3;
+  radius: number;
+  limit: number;
+  types: AgentEntityType[];
+  totalWithinRadius: number;
+  returned: number;
+  truncated: boolean;
+  entities: AgentEntitySnapshot[];
+}
+
 export interface ControlStatus {
   launcher: LauncherStatus;
   session: SessionStatus;

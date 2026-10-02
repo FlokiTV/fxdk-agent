@@ -35,8 +35,11 @@ use fxdk_agent_fivem_client::{
 };
 use fxdk_agent_fxserver::{
     FxServerController, FxServerError, FxServerPhase, FxServerSnapshot, FxServerStartOptions,
+    build_fxserver_spec_with_options,
 };
-use fxdk_agent_runtime_web::materialize_sdk_root;
+use fxdk_agent_runtime_web::{
+    GAME_RESOURCE_NAME, cleanup_game_resource, materialize_sdk_root, stage_game_resource,
+};
 use serde::{Deserialize, Serialize};
 use tokio::{
     net::TcpListener,
@@ -494,25 +497,13 @@ async fn start_session(
         "session-{:08}",
         state.session_counter.fetch_add(1, Ordering::Relaxed) + 1
     );
-    set_session_state(
-        &state,
-        Some(session_id),
-        SessionState::Starting,
-        None,
-    )
-    .await;
+    set_session_state(&state, Some(session_id), SessionState::Starting, None).await;
 
     if let Err(error) = start_session_runtime(&state).await {
         let message = error.1.0.error.message.clone();
         rollback_session_runtime(&state).await;
         let session_id = state.session.read().await.id.clone();
-        set_session_state(
-            &state,
-            session_id,
-            SessionState::Error,
-            Some(message),
-        )
-        .await;
+        set_session_state(&state, session_id, SessionState::Error, Some(message)).await;
         return Err(error);
     }
 
@@ -546,6 +537,12 @@ async fn stop_session(
 
     let client_result = state.client.stop().await;
     let server_result = state.fxserver.stop().await;
+    let config = state.config_snapshot().await;
+    let cleanup_result = if server_result.is_ok() {
+        cleanup_managed_game_resource(&config)
+    } else {
+        Ok(())
+    };
 
     if let Err(error) = client_result {
         let message = error.to_string();
@@ -581,13 +578,28 @@ async fn stop_session(
         ));
     }
 
+    if let Err(error) = cleanup_result {
+        let message = error.to_string();
+        let session_id = state.session.read().await.id.clone();
+        set_session_state(
+            &state,
+            session_id,
+            SessionState::Error,
+            Some(message.clone()),
+        )
+        .await;
+        return Err(session_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "SESSION_RUNTIME_CLEANUP_FAILED",
+            message,
+        ));
+    }
+
     set_session_state(&state, None, SessionState::Stopped, None).await;
     Ok(Json(control_status(&state).await))
 }
 
-async fn ensure_session_startable(
-    state: &ControlApiState,
-) -> Result<(), HandlerError> {
+async fn ensure_session_startable(state: &ControlApiState) -> Result<(), HandlerError> {
     let session = state.session.read().await;
     if matches!(
         session.state,
@@ -631,28 +643,28 @@ async fn ensure_session_startable(
     Ok(())
 }
 
-async fn start_session_runtime(
-    state: &ControlApiState,
-) -> Result<(), HandlerError> {
+async fn start_session_runtime(state: &ControlApiState) -> Result<(), HandlerError> {
     let config = state.config_snapshot().await;
-    let options = server_start_options(state, &config)?;
+    let mut options = server_start_options(state, &config)?;
+    stage_managed_game_resource(&config, &mut options)?;
 
-    state
-        .fxserver
-        .start_with_options(&config, options)
-        .await
-        .map_err(server_start_error)?;
+    if let Err(error) = state.fxserver.start_with_options(&config, options).await {
+        let _ = cleanup_managed_game_resource(&config);
+        return Err(server_start_error(error));
+    }
 
     let sdk_root = match materialize_sdk_root() {
         Ok(root) => root,
         Err(error) => {
             let _ = state.fxserver.stop().await;
+            let _ = cleanup_managed_game_resource(&config);
             return Err(client_runtime_prepare_error(error));
         }
     };
 
     if let Err(error) = state.client.start(&config, &sdk_root).await {
         let _ = state.fxserver.stop().await;
+        let _ = cleanup_managed_game_resource(&config);
         return Err(client_start_error(error));
     }
 
@@ -664,9 +676,7 @@ async fn start_session_runtime(
     Ok(())
 }
 
-async fn wait_for_client_active(
-    client: &FivemClientController,
-) -> Result<(), HandlerError> {
+async fn wait_for_client_active(client: &FivemClientController) -> Result<(), HandlerError> {
     let deadline = Instant::now() + SESSION_CLIENT_ACTIVE_TIMEOUT;
 
     loop {
@@ -704,6 +714,8 @@ async fn rollback_session_runtime(state: &ControlApiState) {
     state.agent_bridge.reset().await;
     let _ = state.client.stop().await;
     let _ = state.fxserver.stop().await;
+    let config = state.config_snapshot().await;
+    let _ = cleanup_managed_game_resource(&config);
 }
 
 async fn set_session_state(
@@ -718,11 +730,7 @@ async fn set_session_state(
     session.last_error = last_error;
 }
 
-fn session_error(
-    status: StatusCode,
-    code: &str,
-    message: String,
-) -> HandlerError {
+fn session_error(status: StatusCode, code: &str, message: String) -> HandlerError {
     (
         status,
         Json(ApiErrorResponse {
@@ -750,13 +758,13 @@ async fn start_server(
     State(state): State<ControlApiState>,
 ) -> Result<Json<ControlStatus>, HandlerError> {
     let config = state.config_snapshot().await;
-    let options = server_start_options(&state, &config)?;
+    let mut options = server_start_options(&state, &config)?;
+    stage_managed_game_resource(&config, &mut options)?;
 
-    state
-        .fxserver
-        .start_with_options(&config, options)
-        .await
-        .map_err(server_start_error)?;
+    if let Err(error) = state.fxserver.start_with_options(&config, options).await {
+        let _ = cleanup_managed_game_resource(&config);
+        return Err(server_start_error(error));
+    }
 
     Ok(Json(control_status(&state).await))
 }
@@ -772,11 +780,10 @@ async fn start_server(
 async fn stop_server(
     State(state): State<ControlApiState>,
 ) -> Result<Json<ControlStatus>, HandlerError> {
-    state
-        .fxserver
-        .stop()
-        .await
-        .map_err(server_stop_error)?;
+    state.fxserver.stop().await.map_err(server_stop_error)?;
+
+    let config = state.config_snapshot().await;
+    cleanup_managed_game_resource(&config).map_err(game_resource_cleanup_error)?;
 
     Ok(Json(control_status(&state).await))
 }
@@ -785,21 +792,76 @@ fn server_start_options(
     state: &ControlApiState,
     config: &AppConfig,
 ) -> Result<FxServerStartOptions, HandlerError> {
-    if !config.synthetic_identity.enabled {
-        return Ok(FxServerStartOptions::default());
+    let mut options = FxServerStartOptions::default();
+
+    if config.synthetic_identity.enabled {
+        let store = match &state.identity_store {
+            Some(store) => store.clone(),
+            None => DevIdentityStore::default_local().map_err(dev_identity_error)?,
+        };
+        let identity = store
+            .identity_for_slot(state.client.id())
+            .map_err(dev_identity_error)?;
+        options.synthetic_identity = Some(identity);
     }
 
-    let store = match &state.identity_store {
-        Some(store) => store.clone(),
-        None => DevIdentityStore::default_local().map_err(dev_identity_error)?,
-    };
-    let identity = store
-        .identity_for_slot(state.client.id())
-        .map_err(dev_identity_error)?;
+    Ok(options)
+}
 
-    Ok(FxServerStartOptions {
-        synthetic_identity: Some(identity),
-    })
+fn stage_managed_game_resource(
+    config: &AppConfig,
+    options: &mut FxServerStartOptions,
+) -> Result<(), HandlerError> {
+    build_fxserver_spec_with_options(config, options).map_err(server_start_error)?;
+
+    let server_project = config
+        .server_project
+        .as_deref()
+        .ok_or_else(|| server_start_error(FxServerError::MissingServerProject))?;
+
+    stage_game_resource(server_project).map_err(game_resource_prepare_error)?;
+    options.runtime_resource_name = Some(GAME_RESOURCE_NAME.to_owned());
+
+    Ok(())
+}
+
+fn cleanup_managed_game_resource(config: &AppConfig) -> io::Result<()> {
+    match config.server_project.as_deref() {
+        Some(server_project) => cleanup_game_resource(server_project),
+        None => Ok(()),
+    }
+}
+
+fn game_resource_prepare_error(error: io::Error) -> HandlerError {
+    (
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            StatusCode::CONFLICT
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        },
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "AGENT_GAME_RESOURCE_PREPARE_FAILED".to_owned(),
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
+}
+
+fn game_resource_cleanup_error(error: io::Error) -> HandlerError {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(ApiErrorResponse {
+            ok: false,
+            error: ApiErrorDetail {
+                code: "AGENT_GAME_RESOURCE_CLEANUP_FAILED".to_owned(),
+                message: error.to_string(),
+                detail: None,
+            },
+        }),
+    )
 }
 
 fn dev_identity_error(error: DevIdentityError) -> HandlerError {
@@ -912,19 +974,12 @@ async fn stop_client(
     validate_client_slot(&state, request.client)?;
     state.agent_bridge.reset().await;
 
-    state
-        .client
-        .stop()
-        .await
-        .map_err(client_stop_error)?;
+    state.client.stop().await.map_err(client_stop_error)?;
 
     Ok(Json(control_status(&state).await))
 }
 
-fn validate_client_slot(
-    state: &ControlApiState,
-    client: u32,
-) -> Result<(), HandlerError> {
+fn validate_client_slot(state: &ControlApiState, client: u32) -> Result<(), HandlerError> {
     if client == state.client.id() {
         return Ok(());
     }
@@ -977,9 +1032,7 @@ fn client_start_error(error: FivemClientError) -> HandlerError {
         | FivemClientError::InvalidFiveMPath(_)
         | FivemClientError::InvalidSdkRoot(_)
         | FivemClientError::WrongClientId { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-        FivemClientError::Spawn(_) | FivemClientError::Stop(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        FivemClientError::Spawn(_) | FivemClientError::Stop(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     (
@@ -1267,9 +1320,7 @@ async fn patch_config(
     Ok(Json(candidate))
 }
 
-fn config_validation_error(
-    issues: Vec<ConfigValidationIssue>,
-) -> ConfigHandlerError {
+fn config_validation_error(issues: Vec<ConfigValidationIssue>) -> ConfigHandlerError {
     (
         StatusCode::UNPROCESSABLE_ENTITY,
         Json(ApiErrorResponse {
@@ -1311,7 +1362,25 @@ async fn agent_guide() -> impl IntoResponse {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, status, start_session, stop_session, start_server, stop_server, start_client, stop_client, client_event, agent_capabilities, agent_invoke, agent_runtime_register, agent_runtime_next, agent_runtime_respond, get_config, patch_config, agent_guide),
+    paths(
+        health,
+        status,
+        start_session,
+        stop_session,
+        start_server,
+        stop_server,
+        start_client,
+        stop_client,
+        client_event,
+        agent_capabilities,
+        agent_invoke,
+        agent_runtime_register,
+        agent_runtime_next,
+        agent_runtime_respond,
+        get_config,
+        patch_config,
+        agent_guide
+    ),
     components(schemas(
         HealthResponse,
         ApiErrorResponse,
@@ -1377,7 +1446,7 @@ mod tests {
     use super::{
         AgentInvokeResponse, AgentRuntimeRequest, AgentState, ApiErrorResponse, ControlApiState,
         ControlStatus, HealthResponse, LauncherState, ServerState, SessionState,
-        default_control_addr, router, router_with_state, server_start_options, serve,
+        default_control_addr, router, router_with_state, serve, server_start_options,
     };
 
     fn test_config_store(name: &str) -> ConfigStore {
@@ -1472,7 +1541,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE),
-            Some(&"text/markdown; charset=utf-8".parse().expect("content type"))
+            Some(
+                &"text/markdown; charset=utf-8"
+                    .parse()
+                    .expect("content type")
+            )
         );
 
         let body = to_bytes(response.into_body(), usize::MAX)
@@ -1502,8 +1575,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("openapi body");
-        let document: serde_json::Value =
-            serde_json::from_slice(&body).expect("openapi json");
+        let document: serde_json::Value = serde_json::from_slice(&body).expect("openapi json");
 
         assert_eq!(document["info"]["title"], "FXDK Agent Control API");
         assert!(document["paths"]["/v1/health"]["get"].is_object());
@@ -1617,8 +1689,7 @@ mod tests {
         let body = to_bytes(invoke.into_body(), usize::MAX)
             .await
             .expect("invoke body");
-        let response: AgentInvokeResponse =
-            serde_json::from_slice(&body).expect("invoke json");
+        let response: AgentInvokeResponse = serde_json::from_slice(&body).expect("invoke json");
         assert!(response.ok);
         assert_eq!(response.result.expect("result")["pong"], true);
     }
@@ -1662,8 +1733,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("timeout body");
-        let error: ApiErrorResponse =
-            serde_json::from_slice(&body).expect("timeout error json");
+        let error: ApiErrorResponse = serde_json::from_slice(&body).expect("timeout error json");
         assert_eq!(error.error.code, "AGENT_REQUEST_TIMEOUT");
     }
 
@@ -1736,8 +1806,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("session stop body");
-        let status: ControlStatus =
-            serde_json::from_slice(&body).expect("session stop json");
+        let status: ControlStatus = serde_json::from_slice(&body).expect("session stop json");
 
         assert_eq!(status.session.state, SessionState::Stopped);
         assert_eq!(status.session.id, None);
@@ -1747,11 +1816,10 @@ mod tests {
     fn server_start_options_skip_identity_when_disabled() {
         let store = test_identity_store("disabled");
         let path = store.path().to_path_buf();
-        let state = ControlApiState::in_memory(AppConfig::default())
-            .with_identity_store(store);
+        let state = ControlApiState::in_memory(AppConfig::default()).with_identity_store(store);
 
-        let options = server_start_options(&state, &AppConfig::default())
-            .expect("server start options");
+        let options =
+            server_start_options(&state, &AppConfig::default()).expect("server start options");
 
         assert!(options.synthetic_identity.is_none());
         assert!(!path.exists());
@@ -1764,8 +1832,7 @@ mod tests {
             synthetic_identity: SyntheticIdentityConfig { enabled: true },
             ..AppConfig::default()
         };
-        let state = ControlApiState::in_memory(config.clone())
-            .with_identity_store(store.clone());
+        let state = ControlApiState::in_memory(config.clone()).with_identity_store(store.clone());
 
         let first = server_start_options(&state, &config)
             .expect("first identity")
@@ -1870,8 +1937,7 @@ mod tests {
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("client stop body");
-        let status: ControlStatus =
-            serde_json::from_slice(&body).expect("client stop json");
+        let status: ControlStatus = serde_json::from_slice(&body).expect("client stop json");
         assert!(status.clients.is_empty());
     }
 
@@ -2051,7 +2117,10 @@ mod tests {
                 .field,
             "serverProject"
         );
-        assert_eq!(store.load().expect("persisted config"), AppConfig::default());
+        assert_eq!(
+            store.load().expect("persisted config"),
+            AppConfig::default()
+        );
     }
 
     #[tokio::test]
@@ -2094,9 +2163,7 @@ mod tests {
 
         let mut stream = TcpStream::connect(address).await.expect("connect");
         stream
-            .write_all(
-                b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
-            )
+            .write_all(b"GET /v1/health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
             .await
             .expect("write request");
 

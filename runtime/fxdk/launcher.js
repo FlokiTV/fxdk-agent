@@ -5,6 +5,17 @@ const UI_URL = GetConvar('fxdk_agent_ui_url', 'http://127.0.0.1:35419/?client=1'
 const CONTROL_URL = GetConvar('fxdk_agent_control_url', 'http://127.0.0.1:35418');
 const CLIENT_ID = Number(GetConvar('fxdk_agent_client', '1')) || 1;
 
+const BASE_AGENT_CAPABILITIES = [
+  'runtime.ping',
+  'runtime.status',
+];
+const SUPPORTED_GAME_CAPABILITIES = new Set([
+  'game.player',
+  'game.resources',
+  'game.entities.nearby',
+]);
+const GAME_REQUEST_TIMEOUT_MS = 3500;
+
 let gameProcessState = 0;
 let gameLaunched = false;
 let connectionState = 0;
@@ -12,16 +23,17 @@ let connectionRequested = false;
 let active = false;
 let agentRegistered = false;
 let agentPollInFlight = false;
+let gameBridgeReady = false;
+let gameCapabilities = [];
+let latestSdkMessageType = null;
 
-const AGENT_CAPABILITIES = [
-  'runtime.ping',
-  'runtime.status',
-];
+const pendingGameRequests = new Map();
 
 const requestJson = (method, path, payload, timeout = 2000) => new Promise((resolve, reject) => {
   const body = payload === undefined ? null : JSON.stringify(payload);
   const url = new URL(path, CONTROL_URL);
   const headers = { accept: 'application/json' };
+
   if (body !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = Buffer.byteLength(body);
@@ -31,7 +43,7 @@ const requestJson = (method, path, payload, timeout = 2000) => new Promise((reso
     {
       hostname: url.hostname,
       port: Number(url.port || 80),
-      path: `${url.pathname}${url.search}`,
+      path: url.pathname + url.search,
       method,
       timeout,
       headers,
@@ -84,6 +96,7 @@ const postEvent = (kind, data = {}) => {
     },
     (response) => response.resume(),
   );
+
   request.on('timeout', () => request.destroy());
   request.on('error', () => undefined);
   request.end(body);
@@ -93,11 +106,173 @@ const notifyBrowser = (payload) => {
   emit('sdk:api:send', JSON.stringify(payload));
 };
 
+const agentFailure = (code, message, detail) => {
+  const error = new Error(message);
+  error.agentCode = code;
+  error.agentDetail = detail;
+  return error;
+};
+
+const runtimeContext = () => ({
+  clientId: CLIENT_ID,
+  serverAddress: SERVER_ADDRESS,
+  gameProcessState,
+  connectionState,
+  active,
+  timestamp: new Date().toISOString(),
+});
+
+const requireGameReady = () => {
+  if (!active || gameProcessState !== 2) {
+    throw agentFailure(
+      'AGENT_GAME_NOT_READY',
+      'game state is unavailable until the managed client is ACTIVE',
+      { gameProcessState, connectionState, active },
+    );
+  }
+
+  if (!gameBridgeReady) {
+    throw agentFailure(
+      'AGENT_GAME_BRIDGE_UNAVAILABLE',
+      'the managed in-game resource has not reported ready',
+      { gameBridgeReady },
+    );
+  }
+};
+
+const advertisedCapabilities = () => [
+  ...BASE_AGENT_CAPABILITIES,
+  ...(gameBridgeReady ? gameCapabilities : []),
+];
+
+const resetGameBridge = (code = 'AGENT_GAME_BRIDGE_RESET') => {
+  gameBridgeReady = false;
+  gameCapabilities = [];
+  agentRegistered = false;
+
+  for (const pending of pendingGameRequests.values()) {
+    clearTimeout(pending.timer);
+    pending.reject(agentFailure(
+      code,
+      'in-game Agent bridge was reset before the request completed',
+    ));
+  }
+
+  pendingGameRequests.clear();
+};
+
+const handleSdkMessage = (rawMessage) => {
+  let message;
+
+  try {
+    message = typeof rawMessage === 'string'
+      ? JSON.parse(rawMessage)
+      : rawMessage;
+  } catch {
+    latestSdkMessageType = 'invalid-json';
+    return;
+  }
+
+  if (!message || typeof message.type !== 'string') return;
+  latestSdkMessageType = message.type;
+
+  if (message.type === 'fxdk-agent:ready') {
+    const announced = Array.isArray(message.data?.capabilities)
+      ? message.data.capabilities
+      : [];
+
+    gameCapabilities = [...new Set(
+      announced
+        .map((capability) => String(capability))
+        .filter((capability) => SUPPORTED_GAME_CAPABILITIES.has(capability)),
+    )].sort();
+
+    gameBridgeReady = true;
+    agentRegistered = false;
+    registerAgentRuntime();
+    return;
+  }
+
+  if (message.type === 'fxdk-agent:stopped') {
+    resetGameBridge();
+    return;
+  }
+
+  if (message.type !== 'fxdk-agent:response') return;
+
+  const response = message.data;
+  if (!response || typeof response.requestId !== 'string') return;
+
+  const pending = pendingGameRequests.get(response.requestId);
+  if (!pending) return;
+
+  pendingGameRequests.delete(response.requestId);
+  clearTimeout(pending.timer);
+
+  if (response.ok) {
+    const result = response.result && typeof response.result === 'object'
+      ? { ...response.result, context: runtimeContext() }
+      : { value: response.result, context: runtimeContext() };
+    pending.resolve(result);
+    return;
+  }
+
+  pending.reject(agentFailure(
+    response.error?.code || 'AGENT_GAME_EXECUTION_FAILED',
+    response.error?.message || 'in-game Agent request failed',
+    response.error?.detail,
+  ));
+};
+
+const executeGameRequest = (request) => {
+  requireGameReady();
+
+  if (!gameCapabilities.includes(request.method)) {
+    throw agentFailure(
+      'AGENT_METHOD_UNSUPPORTED',
+      'in-game method is not advertised by the current runtime: ' + String(request.method),
+      { method: request.method, capabilities: gameCapabilities },
+    );
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingGameRequests.delete(request.requestId);
+      reject(agentFailure(
+        'AGENT_GAME_REQUEST_TIMEOUT',
+        'in-game Agent request timed out',
+        { requestId: request.requestId, method: request.method },
+      ));
+    }, GAME_REQUEST_TIMEOUT_MS);
+
+    pendingGameRequests.set(request.requestId, { resolve, reject, timer });
+
+    try {
+      emit(
+        'sdk:sendGameClientEvent',
+        'fxdk-agent:request',
+        JSON.stringify({
+          requestId: request.requestId,
+          method: request.method,
+          params: request.params || {},
+        }),
+      );
+    } catch (error) {
+      clearTimeout(timer);
+      pendingGameRequests.delete(request.requestId);
+      reject(agentFailure(
+        'AGENT_GAME_BRIDGE_SEND_FAILED',
+        error instanceof Error ? error.message : String(error),
+      ));
+    }
+  });
+};
+
 const registerAgentRuntime = async () => {
   try {
     const response = await requestJson('POST', '/v1/agent/runtime/register', {
       clientId: CLIENT_ID,
-      capabilities: AGENT_CAPABILITIES,
+      capabilities: advertisedCapabilities(),
     });
     agentRegistered = response.statusCode === 200;
   } catch {
@@ -106,28 +281,21 @@ const registerAgentRuntime = async () => {
 };
 
 const executeAgentRequest = async (request) => {
-  if (!request || typeof request.requestId !== 'string') {
-    return;
-  }
+  if (!request || typeof request.requestId !== 'string') return;
 
   let response;
-  if (request.method === 'runtime.ping') {
-    response = {
-      requestId: request.requestId,
-      clientId: CLIENT_ID,
-      ok: true,
-      result: {
+
+  try {
+    let result;
+
+    if (request.method === 'runtime.ping') {
+      result = {
         pong: true,
         clientId: CLIENT_ID,
         timestamp: new Date().toISOString(),
-      },
-    };
-  } else if (request.method === 'runtime.status') {
-    response = {
-      requestId: request.requestId,
-      clientId: CLIENT_ID,
-      ok: true,
-      result: {
+      };
+    } else if (request.method === 'runtime.status') {
+      result = {
         clientId: CLIENT_ID,
         serverAddress: SERVER_ADDRESS,
         gameProcessState,
@@ -135,16 +303,35 @@ const executeAgentRequest = async (request) => {
         gameLaunched,
         connectionRequested,
         active,
-      },
+        gameBridgeReady,
+        gameCapabilities,
+        latestSdkMessageType,
+      };
+    } else if (SUPPORTED_GAME_CAPABILITIES.has(request.method)) {
+      result = await executeGameRequest(request);
+    } else {
+      throw agentFailure(
+        'AGENT_METHOD_UNSUPPORTED',
+        'unsupported runtime method: ' + String(request.method),
+        { method: request.method },
+      );
+    }
+
+    response = {
+      requestId: request.requestId,
+      clientId: CLIENT_ID,
+      ok: true,
+      result,
     };
-  } else {
+  } catch (error) {
     response = {
       requestId: request.requestId,
       clientId: CLIENT_ID,
       ok: false,
       error: {
-        code: 'AGENT_METHOD_UNSUPPORTED',
-        message: `unsupported runtime method: ${String(request.method)}`,
+        code: error?.agentCode || 'AGENT_RUNTIME_EXECUTION_FAILED',
+        message: error instanceof Error ? error.message : String(error),
+        detail: error?.agentDetail,
       },
     };
   }
@@ -171,7 +358,7 @@ const pollAgentRequest = async () => {
 
     const response = await requestJson(
       'GET',
-      `/v1/agent/runtime/next?clientId=${CLIENT_ID}`,
+      '/v1/agent/runtime/next?clientId=' + CLIENT_ID,
       undefined,
       1500,
     );
@@ -190,6 +377,7 @@ const pollAgentRequest = async () => {
 
 const connect = (reason) => {
   if (active) return;
+
   connectionRequested = true;
   postEvent('connect-requested', { reason, serverAddress: SERVER_ADDRESS });
   notifyBrowser({
@@ -209,26 +397,35 @@ on('sdk:gameLaunched', () => {
 
 on('sdk:gameProcessStateChanged', (current, previous) => {
   gameProcessState = Number(current) || 0;
+
   if (gameProcessState === 0) {
     gameLaunched = false;
     connectionRequested = false;
     connectionState = 0;
     active = false;
+    resetGameBridge();
   }
+
   postEvent('process-state', {
     current: gameProcessState,
     previous: Number(previous) || 0,
   });
 });
 
+on('sdk:backendMessage', (message) => {
+  handleSdkMessage(message);
+});
+
 on('sdk:connectionStateChanged', (current, previous) => {
   connectionState = Number(current) || 0;
   active = connectionState === 8;
+
   postEvent('connection-state', {
     current: connectionState,
     previous: Number(previous) || 0,
     active,
   });
+
   notifyBrowser({
     type: 'session-connection-state',
     current: connectionState,
@@ -240,6 +437,7 @@ on('sdk:connectionStateChanged', (current, previous) => {
     notifyBrowser({ type: 'session-active', serverAddress: SERVER_ADDRESS });
   } else if (connectionState === 0 && Number(previous) > 0) {
     connectionRequested = false;
+    resetGameBridge();
   }
 });
 

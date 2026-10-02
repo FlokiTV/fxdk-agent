@@ -16,11 +16,16 @@ use directories::BaseDirs;
 use tokio::net::TcpListener;
 
 pub const DEFAULT_RUNTIME_WEB_PORT: u16 = 35_419;
+pub const GAME_RESOURCE_NAME: &str = "fxdk-agent-game";
 
 const INDEX_HTML: &str = include_str!("../../../runtime/fxdk/index.html");
 const GAME_VIEW_JS: &str = include_str!("../../../runtime/fxdk/game-view.js");
 const FXMANIFEST_LUA: &str = include_str!("../../../runtime/fxdk/fxmanifest.lua");
 const LAUNCHER_JS: &str = include_str!("../../../runtime/fxdk/launcher.js");
+const GAME_FXMANIFEST_LUA: &str = include_str!("../../../runtime/fxdk-game/fxmanifest.lua");
+const GAME_CLIENT_JS: &str = include_str!("../../../runtime/fxdk-game/agent-client.js");
+const GAME_RESOURCE_MARKER: &str = "FXDK Agent managed runtime resource v1\n";
+const GAME_RESOURCE_MARKER_FILE: &str = ".fxdk-agent-managed";
 
 pub fn default_runtime_web_addr() -> SocketAddr {
     SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_RUNTIME_WEB_PORT))
@@ -31,8 +36,8 @@ pub async fn bind_default() -> io::Result<TcpListener> {
 }
 
 pub fn materialize_sdk_root() -> io::Result<PathBuf> {
-    let base_dirs = BaseDirs::new()
-        .ok_or_else(|| io::Error::other("local data directory is unavailable"))?;
+    let base_dirs =
+        BaseDirs::new().ok_or_else(|| io::Error::other("local data directory is unavailable"))?;
     let root = base_dirs
         .data_local_dir()
         .join("FXDK Agent")
@@ -49,6 +54,72 @@ pub fn materialize_sdk_root_at(root: &Path) -> io::Result<()> {
     write_asset(&root.join("launcher.js"), LAUNCHER_JS)?;
     write_asset(&root.join("index.html"), INDEX_HTML)?;
     write_asset(&root.join("game-view.js"), GAME_VIEW_JS)?;
+    Ok(())
+}
+
+pub fn stage_game_resource(server_project: &Path) -> io::Result<PathBuf> {
+    let category = server_project.join("resources").join("[fxdk-agent]");
+    let resource = category.join(GAME_RESOURCE_NAME);
+
+    if resource.exists() {
+        ensure_managed_resource(&resource)?;
+        fs::remove_dir_all(&resource)?;
+    }
+
+    fs::create_dir_all(&resource)?;
+    write_asset(&resource.join("fxmanifest.lua"), GAME_FXMANIFEST_LUA)?;
+    write_asset(&resource.join("agent-client.js"), GAME_CLIENT_JS)?;
+    fs::write(
+        resource.join(GAME_RESOURCE_MARKER_FILE),
+        GAME_RESOURCE_MARKER,
+    )?;
+
+    Ok(resource)
+}
+
+pub fn cleanup_game_resource(server_project: &Path) -> io::Result<()> {
+    let category = server_project.join("resources").join("[fxdk-agent]");
+    let resource = category.join(GAME_RESOURCE_NAME);
+
+    if !resource.exists() {
+        return Ok(());
+    }
+
+    ensure_managed_resource(&resource)?;
+    fs::remove_dir_all(&resource)?;
+
+    if category
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_none())
+    {
+        fs::remove_dir(category)?;
+    }
+
+    Ok(())
+}
+
+fn ensure_managed_resource(resource: &Path) -> io::Result<()> {
+    let marker = resource.join(GAME_RESOURCE_MARKER_FILE);
+    let content = fs::read_to_string(&marker).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace existing non-managed resource at {}",
+                resource.display()
+            ),
+        )
+    })?;
+
+    if content != GAME_RESOURCE_MARKER {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "refusing to replace existing non-managed resource at {}",
+                resource.display()
+            ),
+        ));
+    }
+
     Ok(())
 }
 
@@ -100,7 +171,7 @@ fn asset(content_type: &'static str, body: &'static str) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, process};
+    use std::{fs, io, process};
 
     use axum::{
         body::{Body, to_bytes},
@@ -108,7 +179,10 @@ mod tests {
     };
     use tower::ServiceExt;
 
-    use super::{default_runtime_web_addr, materialize_sdk_root_at, router};
+    use super::{
+        GAME_RESOURCE_NAME, cleanup_game_resource, default_runtime_web_addr,
+        materialize_sdk_root_at, router, stage_game_resource,
+    };
 
     #[test]
     fn runtime_web_is_loopback_only() {
@@ -117,20 +191,22 @@ mod tests {
 
     #[test]
     fn materializes_self_contained_sdk_root() {
-        let root = std::env::temp_dir().join(format!(
-            "fxdk-agent-runtime-web-test-{}",
-            process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fxdk-agent-runtime-web-test-{}", process::id()));
         let _ = fs::remove_dir_all(&root);
 
         materialize_sdk_root_at(&root).expect("materialize sdk root");
 
-        for file in ["fxmanifest.lua", "launcher.js", "index.html", "game-view.js"] {
+        for file in [
+            "fxmanifest.lua",
+            "launcher.js",
+            "index.html",
+            "game-view.js",
+        ] {
             assert!(root.join(file).is_file(), "{file} must be materialized");
         }
 
-        let launcher = fs::read_to_string(root.join("launcher.js"))
-            .expect("launcher js");
+        let launcher = fs::read_to_string(root.join("launcher.js")).expect("launcher js");
         assert!(launcher.contains("sdk:startGame"));
         assert!(launcher.contains("/v1/client/events"));
         assert!(launcher.contains("/v1/agent/runtime/register"));
@@ -138,6 +214,51 @@ mod tests {
         assert!(launcher.contains("/v1/agent/runtime/respond"));
         assert!(launcher.contains("runtime.ping"));
         assert!(launcher.contains("runtime.status"));
+        assert!(launcher.contains("sdk:sendGameClientEvent"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stages_and_cleans_managed_game_resource() {
+        let root =
+            std::env::temp_dir().join(format!("fxdk-agent-game-resource-test-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("server project");
+
+        let resource = stage_game_resource(&root).expect("stage game resource");
+        assert_eq!(
+            resource.file_name().and_then(|name| name.to_str()),
+            Some(GAME_RESOURCE_NAME)
+        );
+        assert!(resource.join("fxmanifest.lua").is_file());
+        let client = fs::read_to_string(resource.join("agent-client.js")).expect("agent client");
+        assert!(client.contains("game.player"));
+        assert!(client.contains("GetGamePool"));
+
+        cleanup_game_resource(&root).expect("cleanup game resource");
+        assert!(!resource.exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_to_replace_unmanaged_game_resource() {
+        let root = std::env::temp_dir().join(format!(
+            "fxdk-agent-game-resource-conflict-test-{}",
+            process::id()
+        ));
+        let resource = root
+            .join("resources")
+            .join("[fxdk-agent]")
+            .join(GAME_RESOURCE_NAME);
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&resource).expect("conflict resource");
+        fs::write(resource.join("fxmanifest.lua"), "third-party").expect("conflict manifest");
+
+        let error =
+            stage_game_resource(&root).expect_err("unmanaged resource must not be replaced");
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
 
         let _ = fs::remove_dir_all(root);
     }
@@ -177,7 +298,11 @@ mod tests {
         assert_eq!(script.status(), StatusCode::OK);
         assert_eq!(
             script.headers().get(header::CONTENT_TYPE),
-            Some(&"text/javascript; charset=utf-8".parse().expect("content type"))
+            Some(
+                &"text/javascript; charset=utf-8"
+                    .parse()
+                    .expect("content type")
+            )
         );
     }
 }

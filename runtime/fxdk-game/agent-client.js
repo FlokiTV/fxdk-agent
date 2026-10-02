@@ -10,12 +10,82 @@ const SCREENSHOT_RESOURCE_NAME = 'fxdk-agent-screenshot';
 
 const SCREENSHOT_TIMEOUT_MS = 8000;
 const MAX_SCREENSHOT_DATA_URI_BYTES = 32 * 1024 * 1024;
+const SDK_MESSAGE_CHUNK_CHARS = 24 * 1024;
+const MAX_SDK_MESSAGE_CHARS = 36 * 1024 * 1024;
+const MAX_SDK_MESSAGE_CHUNKS = 2048;
 
-const sendSdkMessage = (type, data) => {
+let sdkTransferCounter = 0;
+
+const invokeSdkBackend = (message) => {
   Citizen.invokeNative(
     SEND_SDK_MESSAGE_TO_BACKEND,
-    JSON.stringify({ type, data }),
+    JSON.stringify(message),
   );
+};
+
+const sendSdkMessage = (type, data) => {
+  const serialized = JSON.stringify({ type, data });
+
+  if (serialized.length <= SDK_MESSAGE_CHUNK_CHARS) {
+    invokeSdkBackend({ type, data });
+    return;
+  }
+
+  if (serialized.length > MAX_SDK_MESSAGE_CHARS) {
+    throw agentFailure(
+      'AGENT_SDK_MESSAGE_TOO_LARGE',
+      'Agent SDK message exceeds the bounded transfer size',
+      {
+        chars: serialized.length,
+        maxChars: MAX_SDK_MESSAGE_CHARS,
+      },
+    );
+  }
+
+  const totalChunks = Math.ceil(serialized.length / SDK_MESSAGE_CHUNK_CHARS);
+  if (totalChunks > MAX_SDK_MESSAGE_CHUNKS) {
+    throw agentFailure(
+      'AGENT_SDK_MESSAGE_TOO_MANY_CHUNKS',
+      'Agent SDK message requires too many chunks',
+      {
+        totalChunks,
+        maxChunks: MAX_SDK_MESSAGE_CHUNKS,
+      },
+    );
+  }
+
+  sdkTransferCounter += 1;
+  const transferId = [
+    RESOURCE_NAME,
+    Date.now().toString(36),
+    sdkTransferCounter.toString(36),
+  ].join('-');
+
+  invokeSdkBackend({
+    type: 'fxdk-agent:chunk-begin',
+    data: {
+      transferId,
+      totalChunks,
+      totalLength: serialized.length,
+    },
+  });
+
+  for (let index = 0; index < totalChunks; index += 1) {
+    const start = index * SDK_MESSAGE_CHUNK_CHARS;
+    invokeSdkBackend({
+      type: 'fxdk-agent:chunk',
+      data: {
+        transferId,
+        index,
+        payload: serialized.slice(start, start + SDK_MESSAGE_CHUNK_CHARS),
+      },
+    });
+  }
+
+  invokeSdkBackend({
+    type: 'fxdk-agent:chunk-end',
+    data: { transferId },
+  });
 };
 
 const agentFailure = (code, message, detail) => {

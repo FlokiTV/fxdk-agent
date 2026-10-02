@@ -17,6 +17,9 @@ const SUPPORTED_GAME_CAPABILITIES = new Set([
 ]);
 const GAME_REQUEST_TIMEOUT_MS = 3500;
 const SCREENSHOT_REQUEST_TIMEOUT_MS = 10000;
+const MAX_SDK_TRANSFER_CHARS = 36 * 1024 * 1024;
+const MAX_SDK_TRANSFER_CHUNKS = 2048;
+const SDK_TRANSFER_TTL_MS = 15000;
 
 let gameProcessState = 0;
 let gameLaunched = false;
@@ -30,6 +33,7 @@ let gameCapabilities = [];
 let latestSdkMessageType = null;
 
 const pendingGameRequests = new Map();
+const sdkChunkTransfers = new Map();
 
 const requestJson = (method, path, payload, timeout = 2000) => new Promise((resolve, reject) => {
   const body = payload === undefined ? null : JSON.stringify(payload);
@@ -163,6 +167,96 @@ const resetGameBridge = (code = 'AGENT_GAME_BRIDGE_RESET') => {
   pendingGameRequests.clear();
 };
 
+const handleSdkChunk = (message) => {
+  const chunkTypes = new Set([
+    'fxdk-agent:chunk-begin',
+    'fxdk-agent:chunk',
+    'fxdk-agent:chunk-end',
+  ]);
+
+  if (!chunkTypes.has(message.type)) return false;
+
+  const data = message.data;
+  if (!data || typeof data.transferId !== 'string') return true;
+
+  if (message.type === 'fxdk-agent:chunk-begin') {
+    const totalChunks = Number(data.totalChunks);
+    const totalLength = Number(data.totalLength);
+
+    if (
+      !Number.isInteger(totalChunks)
+      || totalChunks < 1
+      || totalChunks > MAX_SDK_TRANSFER_CHUNKS
+      || !Number.isInteger(totalLength)
+      || totalLength < 1
+      || totalLength > MAX_SDK_TRANSFER_CHARS
+    ) {
+      return true;
+    }
+
+    sdkChunkTransfers.set(data.transferId, {
+      totalChunks,
+      totalLength,
+      chunks: new Array(totalChunks),
+      receivedLength: 0,
+      updatedAt: Date.now(),
+    });
+    return true;
+  }
+
+  if (message.type === 'fxdk-agent:chunk') {
+    const transfer = sdkChunkTransfers.get(data.transferId);
+    const index = Number(data.index);
+    const payload = data.payload;
+
+    if (
+      !transfer
+      || !Number.isInteger(index)
+      || index < 0
+      || index >= transfer.totalChunks
+      || typeof payload !== 'string'
+    ) {
+      return true;
+    }
+
+    const previous = transfer.chunks[index];
+    if (typeof previous === 'string') {
+      transfer.receivedLength -= previous.length;
+    }
+
+    transfer.chunks[index] = payload;
+    transfer.receivedLength += payload.length;
+    transfer.updatedAt = Date.now();
+
+    if (transfer.receivedLength > transfer.totalLength) {
+      sdkChunkTransfers.delete(data.transferId);
+    }
+
+    return true;
+  }
+
+  if (message.type === 'fxdk-agent:chunk-end') {
+    const transfer = sdkChunkTransfers.get(data.transferId);
+    sdkChunkTransfers.delete(data.transferId);
+
+    if (!transfer) return true;
+    if (transfer.receivedLength !== transfer.totalLength) return true;
+    if (transfer.chunks.some((chunk) => typeof chunk !== 'string')) return true;
+
+    const serialized = transfer.chunks.join('');
+    if (serialized.length !== transfer.totalLength) return true;
+
+    try {
+      handleSdkMessage(JSON.parse(serialized));
+    } catch {
+      latestSdkMessageType = 'invalid-chunked-json';
+    }
+    return true;
+  }
+
+  return false;
+};
+
 const handleSdkMessage = (rawMessage) => {
   let message;
 
@@ -176,6 +270,12 @@ const handleSdkMessage = (rawMessage) => {
   }
 
   if (!message || typeof message.type !== 'string') return;
+
+  if (handleSdkChunk(message)) {
+    latestSdkMessageType = message.type;
+    return;
+  }
+
   latestSdkMessageType = message.type;
 
   if (message.type === 'fxdk-agent:ready') {
@@ -342,7 +442,13 @@ const executeAgentRequest = async (request) => {
   }
 
   try {
-    const result = await requestJson('POST', '/v1/agent/runtime/respond', response);
+    const responseTimeoutMs = request.method === 'game.screenshot' ? 10000 : 2000;
+    const result = await requestJson(
+      'POST',
+      '/v1/agent/runtime/respond',
+      response,
+      responseTimeoutMs,
+    );
     if (result.statusCode === 409) {
       agentRegistered = false;
     }
@@ -470,3 +576,12 @@ setInterval(() => {
 }, 5000);
 
 setInterval(pollAgentRequest, 250);
+
+setInterval(() => {
+  const cutoff = Date.now() - SDK_TRANSFER_TTL_MS;
+  for (const [transferId, transfer] of sdkChunkTransfers.entries()) {
+    if (transfer.updatedAt < cutoff) {
+      sdkChunkTransfers.delete(transferId);
+    }
+  }
+}, 5000);

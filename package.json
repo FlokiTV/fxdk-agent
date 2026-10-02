@@ -14,6 +14,7 @@
     "check:rust": "cargo check --workspace",
     "check": "bun run typecheck && bun run check:rust",
     "build:desktop": "bun run --cwd apps/desktop build",
+    "build:windows": "bun run --cwd apps/desktop tauri build --no-bundle",
     "build:rust": "cargo build --workspace",
     "build": "bun run build:desktop && bun run build:rust",
     "dev:desktop": "bun run --cwd apps/desktop tauri dev"

@@ -18,4 +18,6 @@ workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
+fxdk-agent-host = { path = "../../../crates/host" }
 tauri = { version = "2", features = [] }
+tokio.workspace = true

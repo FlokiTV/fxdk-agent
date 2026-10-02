@@ -1018,8 +1018,10 @@ dependencies = [
 name = "fxdk-agent-desktop"
 version = "0.1.0"
 dependencies = [
+ "fxdk-agent-host",
  "tauri",
  "tauri-build",
+ "tokio",
 ]
 
 [[package]]
